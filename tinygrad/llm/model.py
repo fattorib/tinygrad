@@ -53,14 +53,6 @@ def apply_rope(x:Tensor, freqs_cis:Tensor) -> Tensor:
   x1, x2 = x.chunk(2, dim=-1)
   return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
 
-def apply_rope_interleaved(x:Tensor, freqs_cis:Tensor) -> Tensor:
-  # rotate consecutive pairs (ggml ROPE_TYPE_NORM); equivalent to apply_rope on interleave-permuted weights,
-  # but keeps the loaded q/k weights as plain dequant expressions so the custom quant kernels recognize them
-  cos, sin = freqs_cis.reshape(1, 1, x.shape[2], -1).chunk(2, dim=-1)
-  x = x.reshape(*x.shape[:-1], x.shape[-1]//2, 2)
-  x1, x2 = x[..., 0], x[..., 1]
-  return (x1 * cos - x2 * sin).stack(x2 * cos + x1 * sin, dim=-1).flatten(-2)
-
 def pairwise_topk(x: Tensor, k: int) -> tuple[Tensor, Tensor]:
   n = x.shape[-1]
   vals = Tensor.arange(n).reshape(1,1,n).cast(x.dtype).expand(x.shape)
@@ -122,7 +114,6 @@ class TransformerConfig:
   attn_gate: bool = False        # muse-glimmer: separate gate projection, sigmoid(gate) * attn_out before o_proj
   embd_norm: bool = False        # muse-glimmer: weightless RMSNorm on the embeddings
   use_rope: bool = True
-  rope_interleaved: bool = False      # muse-glimmer: rotate consecutive pairs instead of permuting the q/k weights
   rope_layers: tuple[bool, ...] = ()  # muse-glimmer: rope only on sliding-window layers (NoPE on full attention)
   logit_scale: float = 1.0
   final_logit_softcapping: float = 0.0
@@ -235,9 +226,8 @@ class TransformerBlock(FFNBlock):
     if self.config.qk_norm == self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     if self.config.use_rope:
-      rope = apply_rope_interleaved if self.config.rope_interleaved else apply_rope
-      q = rope(q[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(q[..., self.config.rope_dim:], dim=-1)
-      k = rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
+      q = apply_rope(q[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(q[..., self.config.rope_dim:], dim=-1)
+      k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
 
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
     store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
@@ -517,11 +507,11 @@ class Transformer:
     # Permute RoPE weights from interleaved to half-split layout.
     for name in state_dict:
       if arch == 'kimi-linear': continue
-      if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch == 'llama' or kv_lora_rank):
+      if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch in ('llama', 'muse-glimmer') or kv_lora_rank):
         w = state_dict[name].reshape(n_heads, state_dict[name].shape[0]//n_heads, -1)
         prefix = head_dim-rope_dim
         state_dict[name] = w[:, :prefix].cat(w[:, prefix:].rearrange("n (h two) d -> n (two h) d", two=2), dim=1).reshape(-1, w.shape[-1])
-      elif arch == 'llama' and 'attn_k.weight' in name:
+      elif arch in ('llama', 'muse-glimmer') and 'attn_k.weight' in name:
         w = state_dict[name].reshape(n_kv_heads, state_dict[name].shape[0]//n_kv_heads, -1)
         state_dict[name] = w.rearrange("n (h two) d -> n (two h) d", two=2).reshape(-1, w.shape[-1])
       elif kv_lora_rank and 'attn_kv_a_mqa.weight' in name:
@@ -559,7 +549,6 @@ class Transformer:
       post_norm_eps=1e-8 if arch == 'muse-glimmer' else 0.0,
       attn_gate=arch == 'muse-glimmer',  # muse-glimmer/afmoe-style separate gate (qwen35's attn_gate is the ssm gate)
       embd_norm=arch == 'muse-glimmer',
-      rope_interleaved=arch == 'muse-glimmer',
       rope_layers=swa_pattern if arch == 'muse-glimmer' and isinstance(swa_pattern, tuple) else (),
       logit_scale=kv.get(f'{arch}.logit_scale', 1.0),
       final_logit_softcapping=kv.get(f'{arch}.final_logit_softcapping', 0.0))
