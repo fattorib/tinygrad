@@ -2,7 +2,7 @@ from __future__ import annotations
 import enum, functools, itertools, math, pathlib, re
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported, kv_ring_store
+from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_parse, gguf_shard
 from tinygrad.uop.ops import resolve
 
@@ -240,18 +240,12 @@ class TransformerBlock(FFNBlock):
       k = rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
 
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
-    kv = Tensor.stack(k, v).cast(self.cache_kv.dtype)
-    if self.kv_ring:
-      if not isinstance(start_pos, UOp): start_pos = UOp.variable("start_pos", 0, self.config.max_context-1).bind(start_pos)
-      assigned_kv = kv_ring_store(self.cache_kv, kv, start_pos, T, self.kv_ring)
-    else:
-      store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(kv.uop)
-      assigned_kv = Tensor(self.cache_kv.uop.after(store))
-    # on RDNA3/4, use the custom flash attention kernels on the KV cache (they don't support attention sinks)
-    if amd_custom_kernels_supported(x.device) and not hasattr(self, 'attn_sinks'):
-      attn = flash_attention(q, assigned_kv, start_pos+T, window=self.config.sliding_window, ring=self.kv_ring)
+    store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
+    assigned_kv = Tensor(self.cache_kv.uop.after(store))
+    # on RDNA3/4, hybrid models use custom flash attention kernels on the KV cache
+    if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
+      attn = flash_attention(q, assigned_kv, start_pos+T)
       attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
-      if self.config.attn_gate: attn = attn * self.attn_gate(x).sigmoid()
       return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
     k = assigned_kv[0, :, :, 0:start_pos+T, :]
     v = assigned_kv[1, :, :, 0:start_pos+T, :]
@@ -276,22 +270,11 @@ class TransformerBlock(FFNBlock):
     if self.config.attn_gate: attn = attn * self.attn_gate(x).sigmoid()
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
 
-  def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int:
-    # ring caches only hold their last positions: reuse is exact when appending or when nothing was evicted yet
-    if getattr(self, 'kv_ring', 0) and not (prefix_len == cached_len or cached_len <= self.kv_ring): return 0
-    return prefix_len
-
   def _init_state(self, x:Tensor):
     if not hasattr(self, "cache_kv"):
-      # sliding-window layers use a ring-buffered KV cache sized to the window (plus a chunk) on RDNA3/4
-      self.kv_ring = 0
-      window, head_dim = self.config.sliding_window, self.config.head_dim
-      if window and not self.config.attn_sinks and amd_custom_kernels_supported(x.device) and \
-        self.config.max_context > window + 64 and head_dim >= 64 and head_dim & (head_dim-1) == 0:
-        self.kv_ring = (window + 64 + 63) // 64 * 64
       # zeroed so the flash kernels can safely read whole tiles past the valid region (masked lanes multiply by 0)
-      self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.kv_ring or self.config.max_context,
-                                   self.config.head_dim, dtype=dtypes.half, device=x.device if isinstance(x.device, str) else None)
+      self.cache_kv = Tensor.zeros(2, x.shape[0], self.config.n_kv_heads, self.config.max_context, self.config.head_dim,
+                                   dtype=dtypes.half, device=x.device if isinstance(x.device, str) else None)
       if isinstance(x.device, tuple): self.cache_kv = self.cache_kv.shard(x.device, 2).realize()
       self.freqs_cis = precompute_freqs_cis(self.config.rope_dim, self.config.max_context, self.config.rope_theta,
                                             device=x.device, yarn=self.config.yarn)

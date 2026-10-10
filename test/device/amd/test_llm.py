@@ -401,43 +401,6 @@ class TestQ8Quantize(QuantLinearMixin, unittest.TestCase):
   def test_flash_attention_decode_long_context_random(self):
     self._test_flash_decode(8, 2, 128, 257*64, 257*64-13)  # past 256 chunks, with a ragged tail
 
-  def test_flash_attention_decode_window(self): self._test_flash_decode_window(16, 2, 128, 4096, 3000, 256)
-  def test_flash_attention_decode_window_ragged(self): self._test_flash_decode_window(4, 2, 128, 512, 500, 96)
-  def test_flash_attention_decode_window_bigger_than_cache(self): self._test_flash_decode_window(4, 2, 128, 512, 100, 2048)
-  def test_flash_attention_decode_window_symbolic(self):
-    with patch.object(Tensor, "scaled_dot_product_attention", side_effect=AssertionError("expected custom decode")):
-      self._test_flash_decode_window(16, 2, 128, 4096, 3000, 256, symbolic=True)
-
-  def _test_flash_decode_window(self, heads, kv_heads, dim, n, valid, window, symbolic=False):
-    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
-    rng = np.random.default_rng(42)
-    q = rng.normal(size=(1, heads, 1, dim)).astype(np.float16)
-    cache = rng.normal(size=(2, 1, kv_heads, n, dim)).astype(np.float16)
-    lo = max(0, valid-window)  # decode attends to [valid-window, valid)
-    k, v = (np.repeat(c[0, :, lo:valid].astype(np.float32), heads//kv_heads, axis=0) for c in cache)
-    scores = q[0].astype(np.float32) @ k.transpose(0, 2, 1) / np.sqrt(dim)
-    probs = np.exp(scores - scores.max(-1, keepdims=True))
-    expected = (probs / probs.sum(-1, keepdims=True)) @ v
-    cache_tensor = Tensor(cache)
-    if symbolic:
-      start_pos = UOp.variable("start_pos", 0, n-1).bind(valid-1)
-      valid, cache_tensor = start_pos + 1, cache_tensor.realize()
-    np.testing.assert_allclose(flash_attention(Tensor(q), cache_tensor, valid, window=window).numpy(), expected[None], rtol=2e-3, atol=2e-3)
-
-  def test_flash_attention_prefill_window(self):
-    if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3/4 required")
-    rng = np.random.default_rng(42)
-    heads, kv_heads, dim, n, valid, tokens, window = 4, 2, 128, 512, 300, 32, 100
-    q = rng.normal(size=(1, heads, tokens, dim)).astype(np.float16)
-    cache = rng.normal(size=(2, 1, kv_heads, n, dim)).astype(np.float16)
-    k, v = (np.repeat(c[0, :, :valid].astype(np.float32), heads//kv_heads, axis=0) for c in cache)
-    scores = q[0].astype(np.float32) @ k.transpose(0, 2, 1) / np.sqrt(dim)
-    qi, ki = np.arange(valid-tokens, valid)[:, None], np.arange(valid)[None, :]
-    scores = np.where((ki <= qi) & (ki > qi-window), scores, -np.inf)  # causal and sliding-window mask
-    probs = np.exp(scores - scores.max(-1, keepdims=True))
-    expected = (probs / probs.sum(-1, keepdims=True)) @ v
-    np.testing.assert_allclose(flash_attention(Tensor(q), Tensor(cache), valid, window=window).numpy(), expected[None], rtol=2e-3, atol=2e-3)
-
   def test_flash_attention_decode_chunk_round_accumulator_range(self):
     if not amd_custom_kernels_supported(Tensor.empty(1).device): self.skipTest("RDNA3 required")
     valid_kv_len, max_kv_len = 6749, 6784  # three chunk rounds, with a ragged tail
