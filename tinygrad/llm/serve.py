@@ -9,6 +9,14 @@ if TYPE_CHECKING:
 
 def parse_tool_call(s:str) -> tuple[str, typing.Any]|None:
   s = s.strip()
+  # Muse Glimmer ATEM format: <atem:invoke name="X">\n<atem:parameter name="k">v</atem:parameter>\n...</atem:invoke>
+  if (am := re.match(r'<atem:invoke name="([^"]+)">\s*(.*?)\s*(?:</atem:invoke>)?$', s, re.DOTALL)):
+    args = {}
+    for pm in re.finditer(r'<atem:parameter name="([^"]+)">(.*?)(?:</atem:parameter>|$)', am.group(2), re.DOTALL):
+      value = re.sub(r"^\r?\n|\r?\n\Z", "", pm.group(2))
+      try: args[pm.group(1)] = json.loads(value)  # lists/objects are JSON; strings and scalars are bare
+      except json.JSONDecodeError: args[pm.group(1)] = value
+    return am.group(1), args
   if s.startswith("{"):  # hermes JSON format: {"name": ..., "arguments": {...}}
     try:
       call = json.loads(s)
@@ -68,6 +76,30 @@ class StreamRouter:
     if emit: yield "content", emit
     if found: self.mode, self.buf = "tool", "<tool_call>" + self.buf
 
+class ChannelRouter:
+  # routes Muse Glimmer's channel output: "<|start|>assistant to=<recipient><|message|>{body}<|eom|>" messages,
+  # where recipient "self" is reasoning, "user" (or none) is content and anything else is an ATEM tool call.
+  # tool channel bodies are kept in .tool_buf for the final parse. <|eom|>/<|start|>/<|message|> are single special
+  # tokens, so they always arrive whole in one piece and never need partial-tag holdback.
+  def __init__(self):
+    self.buf, self.tool_buf, self.state = "", "", "header"
+  def route(self, piece:str, final:bool=False) -> typing.Iterator[tuple[str, str]]:
+    self.buf += piece
+    while self.buf:
+      if self.state == "header":
+        if "<|message|>" not in self.buf: break
+        header, self.buf = self.buf.split("<|message|>", 1)
+        header = header.removeprefix("<|start|>").removeprefix("assistant")
+        recipient = header.split("to=", 1)[1].strip() if "to=" in header else "user"
+        self.state = {"self":"reasoning_content", "user":"content"}.get(recipient, "tool")
+      else:
+        body, sep, self.buf = self.buf.partition("<|eom|>")  # the final message ends at <|eot|>, which is never streamed
+        if self.state == "tool": self.tool_buf += body
+        elif body: yield self.state, body
+        if not sep: break
+        self.state = "header"
+    if final and self.state == "tool": self.tool_buf, self.buf = self.tool_buf + self.buf, ""
+
 class Handler(VizHandler):
   server: LLMServer
   def log_request(self, code='-', size='-'): pass
@@ -76,7 +108,7 @@ class Handler(VizHandler):
     elif self.path.startswith("/assets/"): super().do_GET()
     else: self.send_data((pathlib.Path(__file__).parent / "chat.html").read_bytes(), content_type="text/html")
   def run_model(self, ids:list[int], model_name:str, include_usage=False, max_tokens:int|None=None, temperature:float=0.0,
-                reasoning:bool=False):
+                router:StreamRouter|ChannelRouter|None=None):
     model, tok = self.server.model, self.server.tok
     prompt_tokens = len(ids)
     cache_start_pos = model.get_start_pos(ids)
@@ -87,7 +119,7 @@ class Handler(VizHandler):
     finish_reason = "stop"
     st = pt = time.perf_counter()
     dec = tok.stream_decoder()
-    router = StreamRouter(reasoning)
+    if router is None: router = StreamRouter()
     def log_stats(interrupted:bool=False):
       et = time.perf_counter()
       total = f"total:{et-st:6.2f}s"
@@ -107,10 +139,13 @@ class Handler(VizHandler):
           break
       for field, delta in router.route(dec(), final=True): yield chunk({field:delta})
       tool_calls: list[dict] = []
-      for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL):
-        if (parsed := parse_tool_call(m.group(1))) is None:
-          stderr_log(f"failed to parse tool call: {m.group(1)[:200]}")
-          yield chunk({"content":m.group(0)})  # don't silently drop output the client can't use
+      raw_calls = [(m.group(1), m.group(0)) for m in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", router.buf, re.DOTALL)] \
+        if isinstance(router, StreamRouter) else \
+        [(m.group(0), m.group(0)) for m in re.finditer(r'<atem:invoke name="[^"]+">.*?(?:</atem:invoke>|$)', router.tool_buf, re.DOTALL)]
+      for raw, full in raw_calls:
+        if (parsed := parse_tool_call(raw)) is None:
+          stderr_log(f"failed to parse tool call: {raw[:200]}")
+          yield chunk({"content":full})  # don't silently drop output the client can't use
         else:
           name, args = parsed
           tool_calls.append({"index":len(tool_calls), "id":f"call_{uuid.uuid4().hex[:24]}", "type":"function",
@@ -148,9 +183,9 @@ class Handler(VizHandler):
 
       # reply
       max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
+      router = ChannelRouter() if rendered.rstrip().endswith("<|start|>assistant") else StreamRouter(rendered.rstrip().endswith("<think>"))
       chunks = self.run_model(ids, body["model"], not body.get("stream") or body.get("stream_options",{}).get("include_usage", False),
-                              max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)),
-                              reasoning=rendered.rstrip().endswith("<think>"))
+                              max_tokens=max_tokens, temperature=float(body.get("temperature", 0.0)), router=router)
       if body.get("stream"): self.stream_json(chunks)
       else:
         out, reasoning, tool_calls, finish_reason = [], [], [], "stop"

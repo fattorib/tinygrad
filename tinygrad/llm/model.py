@@ -109,7 +109,14 @@ class TransformerConfig:
   swiglu_clamp_exp: float|None = None
   swiglu_up_bias: float = 0.0
   sliding_window: int = 0
-  sliding_window_pattern: int = 0
+  sliding_window_pattern: int|tuple[int, ...] = 0  # int: every Nth layer is full ctx; tuple: per-layer sliding flags
+  post_norm_eps: float = 0.0     # muse-glimmer: norms on the attn/ffn outputs before the residual add
+  attn_gate: bool = False        # muse-glimmer: separate gate projection, sigmoid(gate) * attn_out before o_proj
+  embd_norm: bool = False        # muse-glimmer: weightless RMSNorm on the embeddings
+  use_rope: bool = True
+  rope_layers: tuple[bool, ...] = ()  # muse-glimmer: rope only on sliding-window layers (NoPE on full attention)
+  logit_scale: float = 1.0
+  final_logit_softcapping: float = 0.0
 
 class FFNBlock:
   def __init__(self, config:TransformerConfig):
@@ -118,6 +125,9 @@ class FFNBlock:
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm   = nn.RMSNorm(config.dim, config.norm_eps)
     self.ffn_norm    = nn.RMSNorm(config.dim, config.norm_eps)
+    if config.post_norm_eps:
+      self.post_attention_norm = nn.RMSNorm(config.dim, config.post_norm_eps)
+      self.post_ffw_norm       = nn.RMSNorm(config.dim, config.post_norm_eps)
 
     # --- feed-forward (MoE or dense) -------------------------------------
     if config.num_experts > 0:
@@ -178,8 +188,12 @@ class FFNBlock:
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp):
-      h =     x + self._attention(self.attn_norm(x), start_pos)
-      return (h + self._feed_forward(self.ffn_norm(h))).contiguous()
+      a = self._attention(self.attn_norm(x), start_pos)
+      if hasattr(self, 'post_attention_norm'): a = self.post_attention_norm(a)
+      h = x + a
+      f = self._feed_forward(self.ffn_norm(h))
+      if hasattr(self, 'post_ffw_norm'): f = self.post_ffw_norm(f)
+      return (h + f).contiguous()
     return _run(x, start_pos)
 
 class TransformerBlock(FFNBlock):
@@ -196,6 +210,7 @@ class TransformerBlock(FFNBlock):
     self.attn_output = Linear(config.head_dim * config.n_heads, config.dim, bias=config.attn_output_bias)
     if config.qk_norm: self.attn_q_norm, self.attn_k_norm = nn.RMSNorm(config.qk_norm, config.norm_eps), nn.RMSNorm(config.qk_norm, config.norm_eps)
     if config.attn_sinks: self.attn_sinks = {"weight": Tensor.zeros(config.n_heads)}
+    if config.attn_gate: self.attn_gate = Linear(config.dim, config.head_dim * config.n_heads, bias=False)
 
   def _attention(self, x:Tensor, start_pos:int|UOp) -> Tensor:
     q, k, v = self.attn_q(x), self.attn_k(x), self.attn_v(x)
@@ -210,8 +225,9 @@ class TransformerBlock(FFNBlock):
     v = v.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
     if self.config.qk_norm == self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
-    q = apply_rope(q[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(q[..., self.config.rope_dim:], dim=-1)
-    k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
+    if self.config.use_rope:
+      q = apply_rope(q[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(q[..., self.config.rope_dim:], dim=-1)
+      k = apply_rope(k[..., :self.config.rope_dim], self.freqs_cis[start_pos:start_pos+T]).cat(k[..., self.config.rope_dim:], dim=-1)
 
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
     store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
@@ -241,6 +257,7 @@ class TransformerBlock(FFNBlock):
       mask = mask.expand(1, self.config.n_heads, T, start_pos+T).cat(sink_col, dim=-1)
     attn = q.scaled_dot_product_attention(k, v, attn_mask=mask, enable_gqa=True)     # (B,H,T,Hd)
     attn = attn.transpose(1, 2).reshape(B, T, -1)                                    # back to (B,T,D)
+    if self.config.attn_gate: attn = attn * self.attn_gate(x).sigmoid()
     return self.attn_output(attn if not self.config.attn_output_gate else (attn * gate.sigmoid()))
 
   def _init_state(self, x:Tensor):
@@ -400,12 +417,16 @@ class Transformer:
     self.blk:list[FFNBlock] = []
     for i in range(config.num_blocks):
       c = dense_config if i < config.leading_dense_blocks else config
-      if config.sliding_window_pattern != 0 and (i+1) % config.sliding_window_pattern == 0: c = replace(c, sliding_window=0)
+      pattern = config.sliding_window_pattern
+      if not pattern[i] if isinstance(pattern, tuple) else (pattern != 0 and (i+1) % pattern == 0):
+        c = replace(c, sliding_window=0)
+      if config.rope_layers: c = replace(c, use_rope=config.rope_layers[i])
       self.blk.append(GatedDeltaNetBlock(c, config.ssm) if config.ssm and config.ssm_layers[i] else block_cls(c))
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
     self.output = Linear(config.dim, config.vocab_size, bias=False)
     self.max_context = config.max_context
+    self.config = config
     self.has_recurrent_block = any(isinstance(b, GatedDeltaNetBlock) for b in self.blk)
     self._cached_tokens: list[int] = []
     # we specialize the JIT for prefill and rollout
@@ -414,9 +435,12 @@ class Transformer:
 
   def forward(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor) -> Tensor:
     x = self.token_embd(tokens.to(self.token_embd.weight.device)).float()  # (B, T, D)
+    if self.config.embd_norm: x = x * (x.square().mean(-1, keepdim=True) + self.config.norm_eps).rsqrt()
     for block in self.blk: x = block(x, start_pos)
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :].to(tokens.device)
+    if self.config.logit_scale != 1.0: logits = logits * self.config.logit_scale
+    if (cap := self.config.final_logit_softcapping) != 0.0: logits = (logits / cap).tanh() * cap
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
     return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True)
 
@@ -437,7 +461,7 @@ class Transformer:
       assert heads % shard == 0, f"tensor parallel needs the attention heads to split over {shard} devices"
       # shard MLA heads and routed experts while replicating latent projections, KV cache and shared experts
       rules = {**{w: 0 for w in ('token_embd.weight', 'output.weight', 'attn_q.weight', 'attn_k.weight', 'attn_v.weight', 'ffn_gate.weight',
-        'ffn_up.weight', 'attn_q_b.weight', 'attn_k_b.weight', 'attn_v_b.weight')},
+        'ffn_up.weight', 'attn_q_b.weight', 'attn_k_b.weight', 'attn_v_b.weight', 'attn_gate.weight')},
         **{w: 1 for w in ('attn_output.weight', 'ffn_down.weight', 'ffn_gate_exps.weight', 'ffn_up_exps.weight')}, 'ffn_down_exps.weight':2}
       shard_map = {name: rules[k] for name in entries if (k:=re.sub(r"^blk\.\d+\.", "", name)) in rules}
     devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(shard))
@@ -471,6 +495,8 @@ class Transformer:
       state_dict = {k.replace('post_attention_norm', 'ffn_norm'):v for k,v in state_dict.items()}
 
     kv_lora_rank = kv.get(f'{arch}.attention.kv_lora_rank', 0)
+    swa_pattern = kv.get(f'{arch}.attention.sliding_window_pattern', 2 if arch == 'gpt-oss' else 0)
+    if isinstance(swa_pattern, list): swa_pattern = tuple(swa_pattern)
     head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads))
     rope_dim = kv.get(f'{arch}.rope.dimension_count', head_dim)
     yarn = YaRNConfig(factor=kv[f'{arch}.rope.scaling.factor'],
@@ -481,11 +507,11 @@ class Transformer:
     # Permute RoPE weights from interleaved to half-split layout.
     for name in state_dict:
       if arch == 'kimi-linear': continue
-      if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch == 'llama' or kv_lora_rank):
+      if ('attn_q.weight' in name or 'attn_q_b.weight' in name) and (arch in ('llama', 'muse-glimmer') or kv_lora_rank):
         w = state_dict[name].reshape(n_heads, state_dict[name].shape[0]//n_heads, -1)
         prefix = head_dim-rope_dim
         state_dict[name] = w[:, :prefix].cat(w[:, prefix:].rearrange("n (h two) d -> n (two h) d", two=2), dim=1).reshape(-1, w.shape[-1])
-      elif arch == 'llama' and 'attn_k.weight' in name:
+      elif arch in ('llama', 'muse-glimmer') and 'attn_k.weight' in name:
         w = state_dict[name].reshape(n_kv_heads, state_dict[name].shape[0]//n_kv_heads, -1)
         state_dict[name] = w.rearrange("n (h two) d -> n (two h) d", two=2).reshape(-1, w.shape[-1])
       elif kv_lora_rank and 'attn_kv_a_mqa.weight' in name:
@@ -519,7 +545,13 @@ class Transformer:
       swiglu_alpha=1.702 if arch == 'gpt-oss' else 1.0, swiglu_clamp_exp=7.0 if arch == 'gpt-oss' else None,
       swiglu_up_bias=1.0 if arch == 'gpt-oss' else 0.0, attn_sinks='blk.0.attn_sinks.weight' in state_dict,
       sliding_window=kv.get(f'{arch}.attention.sliding_window', 0),
-      sliding_window_pattern=kv.get(f'{arch}.attention.sliding_window_pattern', 2 if arch == 'gpt-oss' else 0))
+      sliding_window_pattern=swa_pattern,
+      post_norm_eps=1e-8 if arch == 'muse-glimmer' else 0.0,
+      attn_gate=arch == 'muse-glimmer',  # muse-glimmer/afmoe-style separate gate (qwen35's attn_gate is the ssm gate)
+      embd_norm=arch == 'muse-glimmer',
+      rope_layers=swa_pattern if arch == 'muse-glimmer' and isinstance(swa_pattern, tuple) else (),
+      logit_scale=kv.get(f'{arch}.logit_scale', 1.0),
+      final_logit_softcapping=kv.get(f'{arch}.final_logit_softcapping', 0.0))
     model = Transformer(config)
     for p in (nn.state.get_parameters(model) if shard > 1 else []): p.to_(devices)
     nn.state.load_state_dict(model, state_dict, verbose=False, consume=True, realize=False)  # NOTE: rope_freqs.weight (32,) is unused
@@ -554,10 +586,12 @@ class Transformer:
     while len(tokens) < self.max_context:
       n_toks = min(chunk_size, len(tokens) - start_pos)
       sp, nt = v_start_pos.bind(start_pos), v_toks.bind(n_toks)
-      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp).realize()
+      out = self(t[:, sp:sp+nt] if start_pos < prompt_len or out is None else out, sp, temp)
       start_pos += n_toks
-      # chunked prefill: keep processing until all prompt tokens are consumed
+      # chunked prefill: keep processing until all prompt tokens are consumed; the next chunk reads the prompt
+      # tokens (not the output), so the output isn't realized until prefill is done
       if start_pos < len(tokens): continue
+      out = out.realize()
       tokens.append(int(out.item()))
       self._cached_tokens = tokens[:-1]
       yield tokens[-1]
