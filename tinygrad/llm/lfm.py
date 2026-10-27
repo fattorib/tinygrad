@@ -2,10 +2,10 @@ from __future__ import annotations
 import functools, itertools, math, pathlib, re
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
-from tinygrad.llm.kernels.amd import Linear, ExpertWeights, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_parse, gguf_shard
 from tinygrad.uop.ops import resolve
-from tinygrad.helpers import unwrap, round_up
+from tinygrad.helpers import unwrap
 
 @dataclass(frozen=True)
 class YaRNConfig:
@@ -94,7 +94,7 @@ class FFNBlock:
 
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm   = nn.RMSNorm(config.dim, config.norm_eps)
-    self.ffn_norm    = nn.RMSNorm(config.dim, config.norm_eps)    
+    self.ffn_norm    = nn.RMSNorm(config.dim, config.norm_eps)
     self.ffn_gate    = Linear(config.dim, config.hidden_dim, bias=False)
     self.ffn_up      = Linear(config.dim, config.hidden_dim, bias=False)
     self.ffn_down    = Linear(config.hidden_dim, config.dim, bias=False)
@@ -106,9 +106,6 @@ class FFNBlock:
   def _reusable_prefix_len(self, prefix_len:int, cached_len:int) -> int: return prefix_len
   def _init_state(self, x:Tensor): raise NotImplementedError
   def _attention(self, x:Tensor, start_pos:int|UOp, idx_mask:Tensor|None=None) -> Tensor: raise NotImplementedError
-  def _indexer_mask(self, x:Tensor, start_pos:int|UOp, idx_mask:Tensor|None) -> Tensor|None:
-    # a full indexer layer selects the top-k tokens for itself and the shared layers after it (MLATransformerBlock)
-    return idx_mask
 
   def __call__(self, x: Tensor, start_pos: int|UOp, idx_mask: Tensor|None=None):
     self._init_state(x)
@@ -117,8 +114,7 @@ class FFNBlock:
     def _run(x:Tensor, start_pos:int|UOp, idx_mask:Tensor|None):
       def attend(h:Tensor) -> tuple[Tensor, Tensor|None]:
         h = self.attn_norm(h)
-        mask = self._indexer_mask(h, start_pos, idx_mask)
-        return self._attention(h, start_pos, mask), mask
+        return self._attention(h, start_pos, None), None
       res_attn = res_ffn = lambda xs, sublayer: (xs + (ret:=sublayer(xs))[0], ret[1])
       x, idx_mask = res_attn(x, attend)
       out = res_ffn(x, lambda h: (self._feed_forward(self.ffn_norm(h)), None))[0].contiguous()
@@ -322,6 +318,7 @@ class Transformer:
     # TODO: remove the need for copy to default device
     kv, entries = gguf_parse(gguf.to(None).realize() if isinstance(gguf, Tensor) else gguf)
     arch = kv['general.architecture']
+    assert arch == 'lfm2', '`lfm.py` only supports the `lfm2` architecture.'
     n_heads, n_kv_heads = kv[f'{arch}.attention.head_count'], kv[f'{arch}.attention.head_count_kv']
     assert shard >= 1, f"shard must be at least 1, got {shard}"
     shard_map:dict[str, int] = {}

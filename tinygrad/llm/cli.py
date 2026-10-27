@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 from tinygrad import nn
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.helpers import partition, DEBUG, Timing, GlobalCounters, Context, fetch, profile_marker, getenv, round_up
-from tinygrad.llm.model import Transformer
+from tinygrad.llm.lfm import Transformer
 if TYPE_CHECKING:
   import jinja2
 
@@ -172,7 +172,7 @@ def main():
   st = time.perf_counter()
   with Context(DEBUG=max(DEBUG.value, 1 if args.serve else 0)):
     path = fetch(models.get(args.model, args.model))
-    model, kv = (Transformer.from_hf if path.is_dir() else Transformer.from_gguf)(path, args.max_context, shard=args.shard)
+    model, kv = (Transformer.from_gguf)(path, args.max_context, shard=args.shard)
   model_name = kv.get('general.name') or kv.get('general.basename') or kv.get('_name_or_path') or args.model
   file_sizes = [y.nbytes()*args.shard for y in UOp.sink(*[x.uop for x in nn.state.get_parameters(model)]).toposort() if y.op is Ops.BUFFER]
   print(f"loaded model \"{model_name}\" at {sum(file_sizes)*1e-9/(time.perf_counter()-st):.2f} GB/s with {sum(file_sizes):,} bytes "
@@ -201,7 +201,8 @@ def main():
     with Context(DEBUG=max(DEBUG.value, 1)): model.warmup()
 
   # start server
-  if args.serve: LLMServer(('', args.serve), model, model_name, tok, template).serve_forever()
+  # TODO(fattorib): fix the typing
+  if args.serve: LLMServer(('', args.serve), model, model_name, tok, template).serve_forever() # type: ignore
 
   # do benchmark
   if args.benchmark is not None:
