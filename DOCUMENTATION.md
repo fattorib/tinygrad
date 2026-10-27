@@ -1,7 +1,7 @@
 To run the CLI: 
 
 ```bash
-uv run python3 -m tinygrad.llm --serve 9001 --max_context 8192
+uv run python3 -m tinygrad.llm --serve 9001 --max_context 8192 --model llama3.2:1b
 ```
 
 
@@ -18,3 +18,11 @@ uv run python3 -m tinygrad.llm --serve 9001 --max_context 8192 --model /home/ben
 uv run python -m ruff check .
 uv run python -m mypy tinygrad/llm
 ```
+
+# Model
+
+LFM arch is here: `https://arxiv.org/pdf/2511.23404`
+
+- Conv block is very simple, really not that much goes into it
+- Attn is standard GQA, ungated
+- FFN block is Swiglu
