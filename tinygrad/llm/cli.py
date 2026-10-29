@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 class SimpleTokenizer:
   def __init__(self, normal_tokens:dict[str, int], special_tokens:dict[str, int], preset:str="llama3",
-               bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None, eom_id:int|None=None, chat_template:str|None=None):
+               bos_id:int|None=None, eos_id:int=0, eot_id:int|None=None, eom_id:int|None=None, chat_template:str|None=None, add_bos:bool=True):
     preset = {"qwen35":"qwen2","qwen35moe":"qwen2"}.get(preset, preset)
     if preset not in ("llama3","llama-v3","llama-bpe","qwen2","olmo","kimi-k2","tekken","glm4","gpt-4o", 'lfm2'): # TODO(fattorib): Actually do this properly # noqa
       raise ValueError(f"Invalid tokenizer preset '{preset}'")
@@ -43,6 +43,7 @@ class SimpleTokenizer:
     self._tok2bytes = {tid: tok for tok, tid in self._normal_tokens.items()} | {tid: tok.encode() for tok, tid in self._special_tokens.items()}
     self.preset, self.chat_template = preset, chat_template
     self.bos_id, self.eos_id, self.eot_id, self.eom_id = bos_id, eos_id, eot_id, eom_id
+    self.add_bos = add_bos
 
   @staticmethod
   def from_gguf_kv(kv:dict):
@@ -51,7 +52,7 @@ class SimpleTokenizer:
     normal_tokens, special_tokens = partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] not in (2, 3, 4)) # UNKNOWN|CONTROL|USER_DEFINED
     special_tokens_dict = dict(special_tokens)
     return SimpleTokenizer(dict(normal_tokens), special_tokens_dict, kv["tokenizer.ggml.pre"],
-      bos_id=kv.get('tokenizer.ggml.bos_token_id') if kv.get('tokenizer.ggml.add_bos_token', True) else None,
+      bos_id=kv.get('tokenizer.ggml.bos_token_id'), add_bos=kv.get('tokenizer.ggml.add_bos_token', True),
       eos_id=kv.get('tokenizer.ggml.eos_token_id', 0), eot_id=kv.get('tokenizer.ggml.eot_token_id', special_tokens_dict.get('<|im_end|>')),
       eom_id=kv.get('tokenizer.ggml.eom_token_id'), chat_template=kv.get('tokenizer.chat_template'))
 
@@ -139,7 +140,8 @@ class FallbackTemplate:
     if self.tok.preset == 'tekken': return "[/INST]"
     return self.tok.decode([self.tok.eos_id])
   def render(self, messages:list[dict], tools=None, add_generation_prompt:bool=True, preserve_thinking:bool=False) -> str:
-    out = self.tok.decode([] if self.tok.bos_id is None else [self.tok.bos_id]) + ("<sop>" if self.tok.preset == 'glm4' else "")
+    out = self.tok.decode([] if self.tok.bos_id is None or not self.tok.add_bos else [self.tok.bos_id]) + \
+      ("<sop>" if self.tok.preset == 'glm4' else "")
     for msg in messages:
       out += self.role(msg["role"])
       content = msg.get("content")
@@ -193,7 +195,7 @@ def main():
       env.globals['strftime_now'] = lambda fmt: time.strftime(fmt)
       env.globals['bos_token'] = tok.decode([tok.bos_id]) if tok.bos_id is not None else ""
       env.globals['eos_token'] = tok.decode([tok.eos_id])
-      template = env.from_string(ct)
+      template = env.from_string(re.sub(r"\{%(-?)\s*(?:end)?generation\s*(-?)%\}", r"{#\1 generation \2#}", ct))
     except ImportError: print("warning: jinja2 is not installed, the model's chat template is disabled")
 
   # warmup the JIT

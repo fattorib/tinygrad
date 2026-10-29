@@ -2,7 +2,7 @@ from __future__ import annotations
 import functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
-from tinygrad.llm.kernels.amd import Linear, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported
 from tinygrad.llm.gguf import gguf_parse, gguf_shard
 from tinygrad.uop.ops import resolve
 
@@ -129,7 +129,6 @@ class TransformerBlock(FFNBlock):
     if self.config.qk_norm and self.config.qk_norm != self.config.head_dim: q, k = self.attn_q_norm(q), self.attn_k_norm(k)
 
     B, T, _ = x.shape
-    # LFM3 uses one sigmoid gate scalar per head, broadcast over that head's channels
     gate = self.attn_gate(x).sigmoid().reshape(B, T, self.config.n_heads, 1) if self.config.attn_output_gate else None
     q = q.reshape(B, T, self.config.n_heads,    self.config.head_dim).transpose(1, 2)  # (B,H,T,Hd)
     k = k.reshape(B, T, self.config.n_kv_heads, self.config.head_dim).transpose(1, 2)  # (B,KvH,T,Hd)
@@ -149,9 +148,11 @@ class TransformerBlock(FFNBlock):
     store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
     assigned_kv = Tensor(self.cache_kv.uop.after(store))
     # on RDNA3/4, hybrid models use custom flash attention kernels on the KV cache
-    if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
-      attn = flash_attention(q, assigned_kv, start_pos+T)
-      return project_output(attn.transpose(1, 2))
+
+    # TODO(fattorib): skipped as this doesn't work with SWA properly
+    # if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
+    #   attn = flash_attention(q, assigned_kv, start_pos+T)
+    #   return project_output(attn.transpose(1, 2))
     k = assigned_kv[0, :, :, 0:start_pos+T, :]
     v = assigned_kv[1, :, :, 0:start_pos+T, :]
 
@@ -195,16 +196,12 @@ class GatedShortConvBlock(FFNBlock):
 
     conv_state = initial.where(0, self.conv_state)
     # assemble the conv window in a static-size buffer: [conv_state | states rows | zero-pad].
-    # padded steps are exact no-ops: beta=0 (delta rule off), log_alpha=0 (decay 1 after exp)
     conv_window = conv_state.cat(states.cast(conv_state.dtype), dim=1)
     conv_window = conv_window.pad_to((BS, self.ssm_conv_kernel-1 + T_pad, self.conv_channels)).contiguous()
-
-    # TODO(fattorib): Need to use uop.after to schedule this later...?
-    # the last conv_kernel-1 columns of the window become the next conv state
     conv_state_store = self.conv_state.uop.store(conv_window[:, T:T+self.ssm_conv_kernel-1].cast(self.conv_state.dtype).uop) # noqa
     conv_out = functools.reduce(lambda a,b: a+b,
-      (conv_window[:, i:i+T_pad] * self.conv["weight"][:, i] for i in range(self.ssm_conv_kernel)))
-
+      (conv_window[:, i:i+T_pad] * self.conv["weight"][:, i] for i in range(self.ssm_conv_kernel))).contiguous()
+    conv_out = Tensor(conv_out.uop.after(conv_state_store))
     if symbolic: conv_out = conv_out[:, :T] # TODO(fattorib): ???
     return self.out_proj(C*conv_out)
   def _init_state(self, x):
@@ -221,8 +218,12 @@ class Transformer:
     for i in range(config.num_blocks):
       c = dense_config
       if config.sliding_window != 0 and not config.sliding_window_pattern[i]: c = replace(c, sliding_window=0)
+       # TODO (fattorib): all this rope handling is bleh
       if config.sliding_window != 0 and not config.sliding_window_pattern[i] and (pr:=config.partial_rotary_factor) != 1.0:
-        c = replace(c, partial_rotary_factor=pr) # TODO (fattorib): bleh
+        c = replace(c, partial_rotary_factor=pr)
+      if config.sliding_window != 0 and config.sliding_window_pattern[i] and (pr:=config.partial_rotary_factor) != 1.0:
+        c = replace(c, partial_rotary_factor=1.0)
+        c = replace(c, rope_theta=config.rope_theta_swa)
       self.blk.append(GatedShortConvBlock(c, config.ssm) if config.ssm and config.ssm_layers[i] else block_cls(c))
     self.token_embd  = nn.Embedding(config.vocab_size, config.dim)
     self.output_norm = nn.RMSNorm(config.dim, config.norm_eps)
