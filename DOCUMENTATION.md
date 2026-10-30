@@ -36,7 +36,7 @@ JITBEAM=0 uv run python3 -m tinygrad.llm --max_context 262144 --model $MPATH --w
 ```
 
 
-Initial Results
+1. Initial Results
 (2500, 128)
 ```
 JITBEAM=0
@@ -56,4 +56,21 @@ decode    127:  23.67 ms,    42.24 tok/s,   59.87 GB/s, 1417/9007 MB
 prefill  2500: 3602.34 ms,   693.99 tok/s,  118.06 GB/s, 425286/9203 MB
 ...
 decode    127:  22.45 ms,    44.55 tok/s,   61.32 GB/s, 1376/9240 MB
+```
+
+
+2. Flash Attention on non-SWA Layers
+
+```JITBEAM=1
+prefill  2500: 3730.92 ms,   670.08 tok/s,   70.82 GB/s, 264212/8492 MB
+...
+decode    127:  18.21 ms,    54.91 tok/s,   71.23 GB/s, 1297/8528 MB
+```
+
+3. Flash Attention all all layers
+
+```JITBEAM=1
+prefill  2500: 3400.21 ms,   735.25 tok/s,   37.21 GB/s, 126514/7319 MB
+...
+decode    127:  13.75 ms,    72.74 tok/s,   86.95 GB/s, 1195/7322 MB
 ```

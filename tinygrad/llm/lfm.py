@@ -147,11 +147,11 @@ class TransformerBlock(FFNBlock):
     # NOTE: we don't want to change self.cache_kv, the function API doesn't support this well
     store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
     assigned_kv = Tensor(self.cache_kv.uop.after(store))
-    # on RDNA3/4, hybrid models use custom flash attention kernels on the KV cache
 
-    if amd_custom_kernels_supported(x.device) and self.config.ssm is not None and self.config.sliding_window == 0:
+    if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
       attn = flash_attention(q, assigned_kv, start_pos+T)
       return project_output(attn.transpose(1, 2))
+
     k = assigned_kv[0, :, :, 0:start_pos+T, :]
     v = assigned_kv[1, :, :, 0:start_pos+T, :]
 
