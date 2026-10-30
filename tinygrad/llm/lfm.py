@@ -2,7 +2,7 @@ from __future__ import annotations
 import functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes, Device
-from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import Linear, amd_custom_kernels_supported, flash_attention
 from tinygrad.llm.gguf import gguf_parse, gguf_shard
 from tinygrad.uop.ops import resolve
 
@@ -149,10 +149,9 @@ class TransformerBlock(FFNBlock):
     assigned_kv = Tensor(self.cache_kv.uop.after(store))
     # on RDNA3/4, hybrid models use custom flash attention kernels on the KV cache
 
-    # TODO(fattorib): skipped as this doesn't work with SWA properly
-    # if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
-    #   attn = flash_attention(q, assigned_kv, start_pos+T)
-    #   return project_output(attn.transpose(1, 2))
+    if amd_custom_kernels_supported(x.device) and self.config.ssm is not None and self.config.sliding_window == 0:
+      attn = flash_attention(q, assigned_kv, start_pos+T)
+      return project_output(attn.transpose(1, 2))
     k = assigned_kv[0, :, :, 0:start_pos+T, :]
     v = assigned_kv[1, :, :, 0:start_pos+T, :]
 
