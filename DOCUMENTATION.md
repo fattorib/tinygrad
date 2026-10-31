@@ -76,4 +76,9 @@ decode    127:  13.75 ms,    72.74 tok/s,   86.95 GB/s, 1195/7322 MB
 ```
 
 
-4. Try SWA
+4. SWA Kernel Modifications
+
+```JITBEAM=1
+prefill  2500: 3949.75 ms,   632.95 tok/s,   66.89 GB/s, 264212/8457 MB  --
+decode    127:  15.48 ms,    64.59 tok/s,   75.40 GB/s, 1167/8460 MB
+```

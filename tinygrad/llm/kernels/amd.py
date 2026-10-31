@@ -609,7 +609,8 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   G, CHUNK, DPL, WAVES, PARTIALS = H // H_KV, block_n, D // WARP_SIZE, waves, out.shape[2]
   assert CHUNK % WAVES == 0
   SEC = CHUNK // WAVES  # keys each wave scans independently
-  total_chunks = (valid_kv_len+CHUNK-1)//CHUNK
+  valid_sequence = min(valid_kv_len, window) if isinstance(valid_kv_len, int) else valid_kv_len.minimum(window)
+  total_chunks = (valid_sequence+CHUNK-1)//CHUNK # we only want to chunk over the actual KV window
   live_chunks = min(total_chunks, PARTIALS) if isinstance(total_chunks, int) else total_chunks.minimum(PARTIALS)
   block_bhkv, block_chunk = UOp.range(B*H_KV, 0, AxisType.GLOBAL), UOp.range(live_chunks, 1, AxisType.GLOBAL)
   lane, wave = UOp.range(WARP_SIZE, -1, axis_type=AxisType.WARP), UOp.range(WAVES, 3, axis_type=AxisType.LOCAL)
@@ -623,9 +624,10 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   valids: list[UOp] = []
   scores: list[list[UOp]] = [[zerof]*G for _ in range(SEC)]
   vfrags: list[tuple[UOp, ...]] = [()]*SEC
+  lb = max(0, valid_kv_len - window) if isinstance(valid_kv_len, int) else (valid_kv_len - window).maximum(0)
   for j in range(SEC):
-    key = chunk_id*CHUNK + wave*SEC + j
-    valid = (key < valid_kv_len) & (key >= (valid_kv_len-window))
+    key = chunk_id*CHUNK + wave*SEC + j + (lb)
+    valid = (key < valid_kv_len) & (key >= (lb))
     valids.append(valid)
     kfrag = _vec_load(cache_kv[0, b, kv_head, key, lane*DPL], DPL)
     # V is prefetched in the score pass so both streams are in flight together
@@ -721,7 +723,8 @@ def amd_flash_attention_decode(q:Tensor, cache_kv:Tensor, valid_kv_len:int|UOp, 
   fxn = functools.partial(_amd_flash_attention_decode_partial, valid_kv_len=valid_kv_len, max_kv_len=max_kv_len, window=window,
                           block_n=64, waves=waves)
   partial, stats = Tensor.custom_kernel(partial, stats, q, cache_kv, fxn=fxn)[:2]
-  live = (valid_kv_len+63)//64
+  valid_sequence = min(valid_kv_len, window) if isinstance(valid_kv_len, int) else valid_kv_len.minimum(window)
+  live = (valid_sequence+63)//64
   live = min(live, chunks) if isinstance(live, int) else live.minimum(chunks)
   out = Tensor.empty(B, H, 1, D, dtype="float32", device=q.device, axis=axis)
   fxn = functools.partial(_amd_flash_decode_combine, live=live)

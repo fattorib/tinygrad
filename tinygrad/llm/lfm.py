@@ -154,6 +154,8 @@ class TransformerBlock(FFNBlock):
       return project_output(attn.transpose(1, 2))
 
     # TODO(fattorib): hacky branch, if we are doing decode, then also do the flash attention decode kernel
+
+    # NOTE: is this really optimal? SWA is only 256 -> pretty low parallelism and you don't read that much
     if amd_custom_kernels_supported(x.device) and resolve(T == 1):
       attn = flash_attention(q, assigned_kv, start_pos+T, self.config.sliding_window)
       return project_output(attn.transpose(1, 2))
