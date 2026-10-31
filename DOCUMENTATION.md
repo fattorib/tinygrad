@@ -67,7 +67,7 @@ prefill  2500: 3730.92 ms,   670.08 tok/s,   70.82 GB/s, 264212/8492 MB
 decode    127:  18.21 ms,    54.91 tok/s,   71.23 GB/s, 1297/8528 MB
 ```
 
-3. Flash Attention all all layers
+3. Flash Attention all all layers -> this is not a valid kernel and is broken
 
 ```JITBEAM=1
 prefill  2500: 3400.21 ms,   735.25 tok/s,   37.21 GB/s, 126514/7319 MB
