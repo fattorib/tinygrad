@@ -82,3 +82,10 @@ decode    127:  13.75 ms,    72.74 tok/s,   86.95 GB/s, 1195/7322 MB
 prefill  2500: 3949.75 ms,   632.95 tok/s,   66.89 GB/s, 264212/8457 MB  --
 decode    127:  15.48 ms,    64.59 tok/s,   75.40 GB/s, 1167/8460 MB
 ```
+
+5. Custom Flash SWA for Prefill too:
+
+```JITBEAM=1
+prefill  2500: 3257.71 ms,   767.41 tok/s,   38.84 GB/s, 126514/7319 MB
+decode    127:   9.78 ms,   102.21 tok/s,  119.33 GB/s, 1167/7322 MB
+```

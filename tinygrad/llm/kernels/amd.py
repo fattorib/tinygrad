@@ -626,8 +626,8 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   vfrags: list[tuple[UOp, ...]] = [()]*SEC
   lb = max(0, valid_kv_len - window) if isinstance(valid_kv_len, int) else (valid_kv_len - window).maximum(0)
   for j in range(SEC):
-    key = chunk_id*CHUNK + wave*SEC + j + (lb)
-    valid = (key < valid_kv_len) & (key >= (lb))
+    key = chunk_id*CHUNK + wave*SEC + j + lb
+    valid = (key < valid_kv_len) & (key >= lb)
     valids.append(valid)
     kfrag = _vec_load(cache_kv[0, b, kv_head, key, lane*DPL], DPL)
     # V is prefetched in the score pass so both streams are in flight together
@@ -734,8 +734,9 @@ def _wmma_fragment(fragment:UOp, lane:UOp, rdna4:bool) -> UOp:
   return fragment.reshape(2, 2, 4)[:, lane//16, :].reshape(8) if rdna4 else fragment
 
 @functools.cache
-def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:int|UOp|None=None, rdna4:bool=False) -> UOp:
+def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, window:int|UOp, q_start:int|UOp|None=None, rdna4:bool=False) -> UOp:
   valid_kv_len, q_start = _unbind(valid_kv_len), _unbind(q_start) if q_start is not None else None
+  window = _unbind(window)
   BH, M, D = q.shape
   _, B, H_KV, physical_n, cache_dim = cache.shape
   k, v = cache[0].reshape(B*H_KV, physical_n, cache_dim), cache[1].reshape(B*H_KV, physical_n, cache_dim)
@@ -775,7 +776,9 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   rm, rn = UOp.range(TM, 250), UOp.range(TN, 251)
   q_idx = q_base + block_m * BLOCK_M + wave_m * WMMA_M + (lane_m*TM + rm if rdna4 else rm*LANES_PER_WAVE_M + lane_m)
   k_idx = n_tile * BLOCK_N + rn * LANES_PER_WAVE_N + lane_n
-  causal = (k_idx <= q_idx) & (k_idx < valid_kv_len)
+  # TODO(fattorib): fix
+  lb = max(0, 1 + q_idx-window) if isinstance(q_idx, int) else (1 +q_idx - window).maximum(0)
+  causal = (k_idx <= q_idx) & (k_idx < valid_kv_len) & (k_idx >= lb)
   S_reg = S_reg.after(S_reg[rm, rn].store(causal.where(S_reg[rm, rn], S_reg[rm, rn].const_like(-math.inf))).end(rm, rn))
   m_ij, rm2 = _reg((TM,), -math.inf, n_tile), UOp.range(TN, 261, AxisType.LOOP)
   m_ij = m_ij.after(m_ij.store(m_ij.after(rm2).maximum(S_reg[:, rm2])).end(rm2))
@@ -795,6 +798,10 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   beta_i, ri4, rj4 = UOp.alloc((TM,), dtypes.float, addrspace=AddrSpace.REG), UOp.range(TM, 330), UOp.range(TD, 331)
   m_new = m_i[ri4].maximum(m_ij[ri4])
   alpha_val, beta_val = ((m_i[ri4] - m_new) * LOG2E).exp2(), ((m_ij[ri4] - m_new) * LOG2E).exp2()
+  ac, bc = alpha_val.isfinite(), beta_val.isfinite()
+  # NOTE(fattorib): required while we compute all attn and mask post-hoc
+  alpha_val = ac.where(alpha_val, alpha_val.const_like(1.0))
+  beta_val = bc.where(beta_val, beta_val.const_like(0.0))
   correction = UOp.group(acc[ri4, rj4].store(alpha_val * acc[ri4, rj4]).end(rj4),
                          l_i[ri4].store(alpha_val * l_i[ri4] + beta_val * p_sum[ri4]),
                          m_i[ri4].store(m_new), beta_i[ri4].store(beta_val)).end(ri4)
@@ -842,7 +849,7 @@ def flash_attention(q:Tensor, assigned_kv:Tensor, valid_end:int|UOp, window:int|
     q, q_start = q.pad_to((*q.shape[:2], T_pad, q.shape[3])), valid_end - T_real
   B, H, T, D = q.shape
   out = Tensor.empty(B, H, T, D, dtype="float32", device=q.device, axis=q.uop.axis).reshape(B*H, T, D)
-  fxn = functools.partial(_amd_flash_attention, valid_kv_len=valid_end, q_start=q_start, rdna4=_is_rdna4(q.device))
+  fxn = functools.partial(_amd_flash_attention, valid_kv_len=valid_end, q_start=q_start, rdna4=_is_rdna4(q.device), window=window)
   if isinstance(valid_end, UOp): assigned_kv = Tensor(assigned_kv.uop.after(valid_end))
   out = Tensor.custom_kernel(out, q.half().reshape(B*H, T, D), assigned_kv, fxn=fxn)[0].reshape(B, H, T, D)
   return out if q_start is None else out[:, :, :T_real]
