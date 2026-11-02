@@ -160,8 +160,6 @@ class TransformerBlock(FFNBlock):
       attn = flash_attention(q, assigned_kv, start_pos+T, self.config.sliding_window)
       return project_output(attn.transpose(1, 2))
 
-    # TODO(fattorib): Hacky sliding window implementation that uses the full cache and also computes the full
-    # qk^t gemv -> v slow!
     k = assigned_kv[0, :, :, 0:start_pos+T, :]
     v = assigned_kv[1, :, :, 0:start_pos+T, :]
 
