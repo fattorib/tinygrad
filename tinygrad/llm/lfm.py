@@ -217,7 +217,7 @@ class Transformer:
     self.blk:list[FFNBlock] = []
     for i in range(config.num_blocks):
       c = dense_config
-      if config.sliding_window_pattern[i]:
+      if not config.sliding_window_pattern[i]:
         c = replace(c, sliding_window=0)
         if (pr:=config.partial_rotary_factor) != 1.0:
           c = replace(c, partial_rotary_factor=pr)
