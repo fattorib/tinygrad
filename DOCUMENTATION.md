@@ -32,7 +32,7 @@ LFM arch is here: `https://www.liquid.ai/blog/lfm3`
 ```
 export MPATH=/home/benjamin/.cache/huggingface/hub/models--LiquidAI--LFM3-1.7B-GGUF/snapshots/b3f2ae5d73cd3c91bf40e8ba752c648aa05dffdf/LFM3-1.7B-Q4_K_M.gguf
 
-JITBEAM=0 uv run python3 -m tinygrad.llm --max_context 262144 --model $MPATH --warmup --benchmark 2500,128
+JITBEAM=1 IGNORE_BEAM_CACHE=1 uv run python3 -m tinygrad.llm --max_context 262144 --model $MPATH --warmup --benchmark 2500,128
 ```
 
 
@@ -84,8 +84,15 @@ decode    127:  15.48 ms,    64.59 tok/s,   75.40 GB/s, 1167/8460 MB
 ```
 
 5. Custom Flash SWA for Prefill too:
-
+Why did this increase decode speed?
 ```JITBEAM=1
 prefill  2500: 3257.71 ms,   767.41 tok/s,   38.84 GB/s, 126514/7319 MB
 decode    127:   9.78 ms,   102.21 tok/s,  119.33 GB/s, 1167/7322 MB
+```
+
+6. Better SWA for Prefill:
+Seems to introduce a per regression on decode and prefill
+```JITBEAM=1
+prefill  2500: 3779.73 ms,   661.42 tok/s,   86.10 GB/s, 325420/8725 MB  -- 
+decode    127:  16.97 ms,    58.93 tok/s,   76.15 GB/s, 1292/8762 MB  --  1203 1204 1205 1206 1207 1208 1209
 ```
