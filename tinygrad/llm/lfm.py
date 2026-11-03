@@ -148,7 +148,7 @@ class TransformerBlock(FFNBlock):
     store = self.cache_kv[:, :, :, start_pos:start_pos+T, :].uop.store(Tensor.stack(k, v).cast(self.cache_kv.dtype).uop)
     assigned_kv = Tensor(self.cache_kv.uop.after(store))
 
-    if amd_custom_kernels_supported(x.device) and self.config.ssm is not None and self.config.sliding_window == 0:
+    if amd_custom_kernels_supported(x.device) and self.config.ssm is not None:
       window = start_pos+T if self.config.sliding_window == 0 else self.config.sliding_window
       attn = flash_attention(q, assigned_kv, start_pos+T, window)
       return project_output(attn.transpose(1, 2))

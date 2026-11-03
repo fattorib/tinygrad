@@ -91,8 +91,7 @@ decode    127:   9.78 ms,   102.21 tok/s,  119.33 GB/s, 1167/7322 MB
 ```
 
 6. Better SWA for Prefill:
-Seems to introduce a per regression on decode and prefill
 ```JITBEAM=1
-prefill  2500: 3779.73 ms,   661.42 tok/s,   86.10 GB/s, 325420/8725 MB  -- 
-decode    127:  16.97 ms,    58.93 tok/s,   76.15 GB/s, 1292/8762 MB  --  1203 1204 1205 1206 1207 1208 1209
+prefill  2500: 3269.78 ms,   764.58 tok/s,   37.70 GB/s, 123257/7553 MB
+decode    127:   9.51 ms,   105.12 tok/s,  122.72 GB/s, 1167/7556 MB
 ```
