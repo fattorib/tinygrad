@@ -202,11 +202,11 @@ class GatedShortConvBlock(FFNBlock):
     conv_out = functools.reduce(lambda a,b: a+b,
       (conv_window[:, i:i+T_pad] * self.conv["weight"][:, i] for i in range(self.ssm_conv_kernel))).contiguous()
     conv_out = Tensor(conv_out.uop.after(conv_state_store))
-    if symbolic: conv_out = conv_out[:, :T] # TODO(fattorib): ???
+    if symbolic: conv_out = conv_out[:, :T]
     return self.out_proj(C*conv_out)
   def _init_state(self, x):
     if not hasattr(self, "conv_state"):
-      self.conv_state = Tensor.zeros(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
+      self.conv_state = Tensor.empty(x.shape[0], self.ssm_conv_kernel-1, self.conv_channels, device=x.device).clone()
 
 class Transformer:
   def __init__(self, config:TransformerConfig):
@@ -323,6 +323,7 @@ class Transformer:
     prefix_len = sum(1 for _ in itertools.takewhile(lambda ab: ab[0] == ab[1], zip(tokens[:-1], self._cached_tokens)))
     return min(block._reusable_prefix_len(prefix_len, len(self._cached_tokens)) for block in self.blk)
 
+  # TODO(fattorib): proper sampler needed (temperature=0.1,top_k=50, repetition_penalty=1.1)
   def generate(self, tokens:list[int], chunk_size:int=32, temperature:float=0.0):
     if self.has_recurrent_block and not amd_custom_kernels_supported(self.token_embd.weight.device): chunk_size = 1
     v_start_pos = UOp.variable("start_pos", 0, self.max_context-1)

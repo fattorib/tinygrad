@@ -95,3 +95,22 @@ decode    127:   9.78 ms,   102.21 tok/s,  119.33 GB/s, 1167/7322 MB
 prefill  2500: 3269.78 ms,   764.58 tok/s,   37.70 GB/s, 123257/7553 MB
 decode    127:   9.51 ms,   105.12 tok/s,  122.72 GB/s, 1167/7556 MB
 ```
+
+
+Issues now:
+1. Cache just gets randomly invalidated sometimes (when it should persist):
+
+```bash
+*** started server on http://127.0.0.1:9001 at 65.98 s                                                                                                                                                          
+/v1/chat/completions  --  prep:    7 ms  --  in:    0 + 1866  --  prefill: 744 tok/s  --  gen:  37 tok/s  --  out:   65  --  total:  4.29s
+/v1/chat/completions  --  prep:   11 ms  --  in: 1931 +   31  --  prefill:  69 tok/s  --  gen:  96 tok/s  --  out:   40  --  total:  0.87s
+/v1/chat/completions  --  prep:   20 ms  --  in: 2002 +  694  --  prefill: 639 tok/s  --  gen: 102 tok/s  --  out:  448  --  total:  5.48s
+/v1/chat/completions  --  prep:   20 ms  --  in: 3144 +   23  --  prefill:  52 tok/s  --  gen:  98 tok/s  --  out:   84  --  total:  1.30s
+/v1/chat/completions  --  prep:   22 ms  --  in:    0 + 3302  --  prefill: 817 tok/s  --  gen: 101 tok/s  --  out:   45  --  total:  4.49s -> weird invalidation here
+/v1/chat/completions  --  prep:   53 ms  --  in: 3347 + 6528  --  prefill: 841 tok/s  --  gen:  98 tok/s  --  out:  588  --  total: 13.78s
+/v1/chat/completions  --  prep:   57 ms  --  in:    0 +10480  --
+```
+This is the conversation: `file:///home/benjamin/tinygrad/pi-session-2026-11-03T13-37-06-691Z_01a1a1a0-b683-7a8e-96a2-604a4b696e66.html`
+
+
+2. preserve_thinking should be false
