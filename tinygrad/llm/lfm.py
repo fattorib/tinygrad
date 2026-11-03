@@ -149,13 +149,8 @@ class TransformerBlock(FFNBlock):
     assigned_kv = Tensor(self.cache_kv.uop.after(store))
 
     if amd_custom_kernels_supported(x.device) and self.config.ssm is not None and self.config.sliding_window == 0:
-      window = start_pos+T # TODO: in place of a real lower bound check
+      window = start_pos+T if self.config.sliding_window == 0 else self.config.sliding_window
       attn = flash_attention(q, assigned_kv, start_pos+T, window)
-      return project_output(attn.transpose(1, 2))
-
-    # TODO(fattorib): hacky branch
-    if amd_custom_kernels_supported(x.device):
-      attn = flash_attention(q, assigned_kv, start_pos+T, self.config.sliding_window)
       return project_output(attn.transpose(1, 2))
 
     k = assigned_kv[0, :, :, 0:start_pos+T, :]
