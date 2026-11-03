@@ -217,11 +217,11 @@ class Transformer:
     self.blk:list[FFNBlock] = []
     for i in range(config.num_blocks):
       c = dense_config
-      if not config.sliding_window_pattern[i]:
+      if config.sliding_window_pattern[i]:
         c = replace(c, sliding_window=0)
         if (pr:=config.partial_rotary_factor) != 1.0:
           c = replace(c, partial_rotary_factor=pr)
-      if config.sliding_window_pattern[i]:
+      else:
         c = replace(c, rope_theta=config.rope_theta_swa)
         if (pr:=config.partial_rotary_factor) != 1.0:
           c = replace(c, partial_rotary_factor=1.0)
@@ -272,15 +272,13 @@ class Transformer:
     num_blocks = kv[f'{arch}.block_count'] - kv.get(f'{arch}.nextn_predict_layers', 0)
     ssm = None
     ssm_layers: tuple[bool, ...] = ()
-    if arch in ('lfm3'):
-      ssm = SSMConfig(conv_kernel=kv[f'{arch}.shortconv.l_cache'])
-      ssm_layers = tuple(n_kv_heads[i] == 0 for i in range(num_blocks))
+    ssm = SSMConfig(conv_kernel=kv[f'{arch}.shortconv.l_cache'])
+    ssm_layers = tuple(n_kv_heads[i] == 0 for i in range(num_blocks))
 
     head_dim = kv.get(f'{arch}.attention.key_length_mla', kv.get(f'{arch}.attention.key_length', kv[f'{arch}.embedding_length'] // n_heads))
     rope_dim = kv.get(f'{arch}.rope.dimension_count', head_dim)
 
-    if arch in ('lfm3'):
-      state_dict = {k.replace('shortconv.', ''):v for k,v in state_dict.items()}
+    state_dict = {k.replace('shortconv.', ''):v for k,v in state_dict.items()}
 
     # TODO (fattorib): just remove all the MoE kv.get(...) overrides
     config = TransformerConfig(
