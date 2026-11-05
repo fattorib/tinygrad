@@ -32,7 +32,7 @@ LFM arch is here: `https://www.liquid.ai/blog/lfm3`
 ```
 export MPATH=/home/benjamin/.cache/huggingface/hub/models--LiquidAI--LFM3-1.7B-GGUF/snapshots/b3f2ae5d73cd3c91bf40e8ba752c648aa05dffdf/LFM3-1.7B-Q4_K_M.gguf
 
-JITBEAM=1 IGNORE_BEAM_CACHE=1 uv run python3 -m tinygrad.llm --max_context 262144 --model $MPATH --warmup --benchmark 2500,128
+JITBEAM=1 uv run python3 -m tinygrad.llm --max_context 262144 --model $MPATH --warmup --benchmark 2500,128
 ```
 
 
@@ -100,6 +100,10 @@ decode    127:   9.51 ms,   105.12 tok/s,  122.72 GB/s, 1167/7556 MB
 Issues now:
 1. Cache just gets randomly invalidated sometimes (when it should persist):
 
+```
+JITBEAM=1 uv run python3 -m tinygrad.llm --max_context 262144 --model $MPATH --warmup --serve 9001
+```
+
 ```bash
 *** started server on http://127.0.0.1:9001 at 65.98 s                                                                                                                                                          
 /v1/chat/completions  --  prep:    7 ms  --  in:    0 + 1866  --  prefill: 744 tok/s  --  gen:  37 tok/s  --  out:   65  --  total:  4.29s
@@ -108,7 +112,7 @@ Issues now:
 /v1/chat/completions  --  prep:   20 ms  --  in: 3144 +   23  --  prefill:  52 tok/s  --  gen:  98 tok/s  --  out:   84  --  total:  1.30s
 /v1/chat/completions  --  prep:   22 ms  --  in:    0 + 3302  --  prefill: 817 tok/s  --  gen: 101 tok/s  --  out:   45  --  total:  4.49s -> weird invalidation here
 /v1/chat/completions  --  prep:   53 ms  --  in: 3347 + 6528  --  prefill: 841 tok/s  --  gen:  98 tok/s  --  out:  588  --  total: 13.78s
-/v1/chat/completions  --  prep:   57 ms  --  in:    0 +10480  --
+/v1/chat/completions  --  prep:   57 ms  --  in:    0 +10480  --   -> weird invalidation here
 ```
 This is the conversation: `file:///home/benjamin/tinygrad/pi-session-2026-11-03T13-37-06-691Z_01a1a1a0-b683-7a8e-96a2-604a4b696e66.html`
 
