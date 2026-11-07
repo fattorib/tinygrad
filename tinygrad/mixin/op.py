@@ -954,9 +954,11 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     x, dim = self, self._resolve_dim(dim)
     if (orig_len := int(x.shape[dim])) <= 1: return x, x.const_like(0, dtypes.default_int)
     # pad to power of 2
-    n_stages = (orig_len-1).bit_length()
-    pads = tuple((0, 2**n_stages - orig_len) if i == dim else None for i in range(x.ndim))
+    n_stages, stage_pad = (orig_len-1).bit_length(), 2**(orig_len-1).bit_length()
+    pads = tuple((0, stage_pad - orig_len) if i == dim else None for i in range(x.ndim))
     x = x._pad_constant(pads, x.dtype.min if descending else x.dtype.max).unflatten(dim, (2,)*n_stages)
+    idx_shape = tuple(stage_pad if i == dim else 1 for i in range(self.ndim))
+    idx = type(self).arange(stage_pad).reshape(idx_shape).unflatten(dim, (2,)*n_stages)
     # https://en.wikipedia.org/wiki/Bitonic_sorter#/media/File:BitonicSort1.svg
     for stage in range(1, n_stages+1):
       if stage != n_stages:
@@ -965,24 +967,25 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
         blue_box, green_box = x.split(1, crossover_dim)
         flip_dims = tuple(-i for i in range(1, stage+1+(self.ndim-dim)))
         x = (blue_box.cat(green_box.flip(flip_dims), dim=crossover_dim)).contiguous()
+        idx_blue_box, idx_green_box = idx.split(1, crossover_dim)
+        idx = (idx_blue_box.cat(idx_green_box.flip(flip_dims), dim=crossover_dim)).contiguous()
       for substage in range(stage-1, -1, -1):
         partner_dim = dim + n_stages - substage - 1
         x_top, x_bottom = x.split(1, partner_dim)
+        idx_top, idx_bottom = idx.split(1, partner_dim)
+        idx_mask = ((x_top > x_bottom) if descending else (x_top < x_bottom) ) | ((x_top.eq(x_bottom)) & (idx_top < idx_bottom))
         x_larger, x_smaller = x_top.maximum(x_bottom), x_top.minimum(x_bottom)
+        idx_first, idx_second = idx_mask.where(idx_top, idx_bottom), idx_mask.where(idx_bottom, idx_top)
         x = (x_larger.cat(x_smaller, dim=partner_dim) if descending else x_smaller.cat(x_larger, dim=partner_dim)).contiguous()
+        idx = (idx_first.cat(idx_second, dim=partner_dim)).contiguous()
       if stage != n_stages:
         # flip wires back to undo the crossover
         blue_box, flipped_green_box = x.split(1, crossover_dim)
+        idx_blue_box, idx_flipped_green_box = idx.split(1, crossover_dim)
         x = blue_box.cat(flipped_green_box.flip(flip_dims), dim=crossover_dim)
+        idx = idx_blue_box.cat(idx_flipped_green_box.flip(flip_dims), dim=crossover_dim)
     x = x.flatten(dim, dim+n_stages-1).shrink_to(self.shape)
-    # compute indices for sorted values
-    mask = self._tri(orig_len, orig_len, 1).logical_not()
-    mask = mask.reshape((None, None) + (1,)*(self.ndim-dim-1))
-    def compute_counts(t:Self): return (mask & t.unsqueeze(dim).eq(t.unsqueeze(dim+1))).sum(dim+1)
-    count_orig, count_sorted = compute_counts(self), compute_counts(x)
-    cond = self.unsqueeze(dim+1).eq(x.unsqueeze(dim)) & count_orig.unsqueeze(dim+1).eq(count_sorted.unsqueeze(dim))
-    idx = type(self).arange(orig_len).reshape(tuple(orig_len if i == dim else 1 for i in range(x.ndim)))
-    idx = (cond * idx.unsqueeze(dim+1)).sum(dim)
+    idx = idx.flatten(dim, dim+n_stages-1).shrink_to(self.shape)
     return x, idx
 
   def argsort(self, dim:int=-1, descending:bool=False) -> Self:

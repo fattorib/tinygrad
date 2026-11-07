@@ -97,6 +97,7 @@ decode    127:   9.51 ms,   105.12 tok/s,  122.72 GB/s, 1167/7556 MB
 ```
 
 
+
 Issues now:
 1. Cache just gets randomly invalidated sometimes (when it should persist):
 
@@ -118,3 +119,29 @@ This is the conversation: `file:///home/benjamin/tinygrad/pi-session-2026-11-03T
 
 
 2. preserve_thinking should be false
+
+
+
+## Top-k
+
+Baseline:
+
+```JITBEAM=1
+prefill  2500: 3369.49 ms,   741.95 tok/s,   36.58 GB/s, 123257/7319 MB  --
+decode    127:  10.10 ms,    107.33 tok/s,  125.30 GB/s, 1167/7322 MB  --  1203 1204 1205 1206 1207 1208 1209
+```
+
+Stock tinygrad top-k:
+
+```JITBEAM=1
+prefill  2500: 3659.14 ms,   683.22 tok/s,   39.32 GB/s, 143890/7367 MB  --
+decode    127:  21.46 ms,    46.60 tok/s,   66.57 GB/s, 1428/7386 MB  --  1203 1204 1205 1206 1207 1208 1209
+```
+
+
+Faster tinygrad top-k:
+
+```JITBEAM=1
+prefill  2500: 3310.61 ms,   755.15 tok/s,   47.52 GB/s, 157307/7320 MB  -- 
+decode    127:   8.26 ms,   121.07 tok/s,  193.52 GB/s, 1598/7323 MB  --  1203 1204 1205 1206 1207 1208 1209
+```
