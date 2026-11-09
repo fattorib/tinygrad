@@ -442,4 +442,3 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
   if splits > 1: result = result.reshape(splits, tokens, out_features).sum(0)
   result = result.reshape(*x.shape[:-1], out_features)
   return result if layer.bias is None else result + layer.bias
-
