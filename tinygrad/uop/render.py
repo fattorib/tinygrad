@@ -1,7 +1,7 @@
 import re
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop import Ops, GroupOp
-from tinygrad.uop.ops import UOp, PatternMatcher, UPat, KernelInfo, CallInfo, range_str, sint
+from tinygrad.uop.ops import UOp, PatternMatcher, UPat, KernelInfo, range_str, sint
 from tinygrad.helpers import strip_parens, colored
 
 def pretty_print(x:UOp, cache=None, d=0)->str:
@@ -37,10 +37,9 @@ def _render_arg(x:UOp) -> str:
       if dt in dtypes.weaks: return repr(v) if dt is dtypes.weakint else repr(float(v))
       if dtypes.is_float(dt): return f"{dt.name}:{float(v).hex()}"   # float.hex() roundtrips exactly, inf/nan included
       return f"{dt.name}:{v}"
-    case Ops.PARAM | Ops.BUFFER | Ops.ALLOC:
+    case Ops.PARAM | Ops.REFPARAM | Ops.BUFFER | Ops.ALLOC:
       a, opts = x.arg, ""
       if a.vmin_vmax is not None: opts += f" bounds=[{a.vmin_vmax[0]},{a.vmin_vmax[1]}]"
-      if a.multiple_of is not None: opts += f" multiple_of={a.multiple_of}"
       if a.addrspace not in (None, AddrSpace.GLOBAL): opts += f" addrspace={a.addrspace.name}"
       if a.device is not None:
         opts += " device=" + (a.device if isinstance(a.device, str) and re.fullmatch(r"[\w:]+", a.device) else repr(a.device))
@@ -49,11 +48,6 @@ def _render_arg(x:UOp) -> str:
       return f"{name}dtype={x.dtype.name} slot={a.slot}{opts}"
     case Ops.RANGE: return f"{x.arg[0].name} {' '.join(map(str, x.arg[1:]))}"   # flatten_range merges ids: WEAK 1 2
     case Ops.SINK: return x.arg.name if isinstance(x.arg, KernelInfo) else ""
-    case Ops.CALL if isinstance(a:=x.arg, CallInfo):
-      call_opts = [f"name={a.name!r}"] if a.name is not None else []
-      if a.grad_fxn is not None: call_opts.append(f"grad_fxn={getattr(a.grad_fxn, '__name__', type(a.grad_fxn).__name__)}")
-      call_opts += [f"{k}=true" for k in ("precompile", "precompile_backward") if getattr(a, k)]
-      return " ".join(call_opts)
     case Ops.REDUCE: return f"op={x.arg[0].name.lower()}" + (f" pop={x.arg[1]}" if x.arg[1] else "")
     case Ops.CAST | Ops.BITCAST: return x.arg.name   # one scalar -> bare
     case Ops.COPY | Ops.SPECIAL: return x.arg   # the whole arg is a device/string

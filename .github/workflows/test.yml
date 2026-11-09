@@ -1,7 +1,7 @@
 name: Unit Tests
 env:
   # increment this when downloads substantially change to avoid the internet
-  CACHE_VERSION: '20'
+  CACHE_VERSION: '21'
   CAPTURE_PROCESS_REPLAY: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.title, '[pr]') && '1' || '0' }}
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   PYTHONPATH: ${{ github.workspace }}
@@ -562,6 +562,12 @@ jobs:
         run: python -m pytest test/null/test_hcq2.py test/runtime/test_hcq2.py
       - name: Run disk copy tests on MOCKPCI
         run: python -m pytest test/runtime/test_disk_tensor.py -k test_copy_from_disk
+      - name: Run test_tiny on MOCKPCI over REMOTE
+        run: |
+          python3 extra/remote/serve.py 6482 &
+          trap 'kill $!' EXIT
+          sleep 1
+          REMOTE=127.0.0.1:6482 python -m pytest test/test_tiny.py
       - name: Run tests on MOCK+HIP
         run: DEV=MOCK+HIP python -m pytest -n=auto test/test_tiny.py test/runtime/test_jit.py test/runtime/test_hcq2.py test/runtime/test_dtype.py
 
@@ -578,6 +584,7 @@ jobs:
     env:
       DEV: MOCKKFD+AMD:${{ matrix.backend == 'amdllvm' && 'LLVM' || '' }}:${{ matrix.arch }}
       SKIP_SLOW_TEST: 1
+      PARALLEL: 0
       PYTHONPATH: .
     steps:
       - name: Checkout Code

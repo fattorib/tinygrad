@@ -11,6 +11,7 @@ from tinygrad.dtype import dtypes, DType, AddrSpace
 from tinygrad.runtime.support.memory import MMIOInterface
 if TYPE_CHECKING:
   from tinygrad.renderer import Renderer
+  from tinygrad.uop.ops import PatternMatcher
 
 # **************** Device ****************
 
@@ -68,7 +69,7 @@ def canonicalize_device(device:str|tuple|list|None) -> str|tuple[str, ...]:
   return canonical[0] if len(canonical:=tuple(Device.canonicalize(d) for d in device)) == 1 else canonical
 
 def is_disk_device(device:str|tuple[str, ...]) -> bool:
-  return any(d.split(":", 1)[0].upper() == "DISK" for d in to_tuple(device))
+  return any(d.split(":", 1)[0].upper() in ("DISK", "NVME") for d in to_tuple(device))
 
 # **************** Profile ****************
 
@@ -181,7 +182,7 @@ class Buffer:
     else: storage = self.allocator.alloc(self.nbytes, self.options)
     storage = replace(storage, host=storage.host.view(self.offset, self.nbytes, fmt='B') if storage.host is not None else None)
     if self._base is None:
-      if not self.device.startswith("DISK") and self.options.external_ptr is None:
+      if not is_disk_device(self.device) and self.options.external_ptr is None:
         GlobalCounters.mem_used += self.nbytes
         GlobalCounters.mem_used_per_device[self.device] += self.nbytes
       if PROFILE: Buffer.profile_events.append(ProfilePointEvent(self.device, "alloc", self.trace_num, {"nbytes":self.nbytes}))
@@ -192,7 +193,7 @@ class Buffer:
     assert self._storage is not None, "buffer must be allocated to deallocate"
     if DEBUG is not None and DEBUG >= 7: print(f"buffer: deallocate {self.nbytes} bytes on {self.device}")
     if self._base is None:
-      if GlobalCounters is not None and not self.device.startswith("DISK") and self.options.external_ptr is None:
+      if GlobalCounters is not None and not is_disk_device(self.device) and self.options.external_ptr is None:
         GlobalCounters.mem_used -= self.nbytes
         GlobalCounters.mem_used_per_device[self.device] -= self.nbytes
       if PROFILE: Buffer.profile_events.append(ProfilePointEvent(self.device, "free", self.trace_num))
@@ -362,7 +363,7 @@ class TinyELF:
       offset += dt.itemsize
 
 class Program(Generic[DeviceType]):
-  def __init__(self, dev:DeviceType, obj:TinyELF): pass
+  def __init__(self, dev:DeviceType, obj:TinyELF, links:dict[str,Program[DeviceType]]): pass
   def __call__(self, *args, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), wait=False) -> float|None: pass
 
 class Compiled:
@@ -376,10 +377,10 @@ class Compiled:
   var_vals: dict[str, int] = {}
 
   # hcq2
-  pm_encode:Any = None
-  pm_lower:Any = None
-  pm_link:Any = None
-  link_bufs:dict[str, Any] = {}
+  pm_encode:PatternMatcher
+  pm_lower:PatternMatcher
+  pm_link:PatternMatcher
+  link_bufs:dict[str, Buffer|Callable[..., Buffer]] = {}
 
   def __init__(self, device:str, allocator:Allocator, renderers:list[type[Renderer]], runtime:type[Program[Self]]|None, arch=None):
     from tinygrad.renderer import Renderer
@@ -404,7 +405,8 @@ class Compiled:
   @property
   def compiler(self) -> Compiler: return self.renderer.compiler
 
-  def runtime(self, obj:TinyELF) -> Program[Self]: return unwrap(self.runtime_t)(self, obj)
+  def runtime(self, obj:TinyELF, links:dict[str,Program[Self]]={}) -> Program[Self]:
+    return unwrap(self.runtime_t)(self, obj, links=links)
 
   @functools.cached_property
   def timeline(self) -> Buffer: # [the signal, the value the last submitted batch signals]

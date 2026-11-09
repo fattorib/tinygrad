@@ -40,6 +40,16 @@ class TestGGUFShard(unittest.TestCase):
           self.assertEqual((out[name].device, out[name].uop.axis), (DEVICES, axis))
           np.testing.assert_array_equal(out[name].to(Device.DEFAULT).numpy(), full[name].numpy())
 
+  def test_repeat(self):
+    # two row blocks (KV heads) over four devices: device i holds block i//2, the blocks must divide the rows and the devices
+    if Device.DEFAULT != "CPU" and Device[Device.DEFAULT].count() < 4: self.skipTest("needs 4 devices")
+    devices = tuple(Device.canonicalize(f'{Device.DEFAULT}:{i}') for i in range(4))
+    entry = (Tensor(random_data((8, 512), Q.Q4_K).reshape(-1), device='CPU'), (8, 512), Q.Q4_K)
+    full, out = gguf_shard({'w': entry}, (Device.DEFAULT,))['w'].numpy(), gguf_shard({'w': entry}, devices, {'w': 0}, {'w': 2})['w']
+    self.assertEqual((out.device, out.uop.axis), (devices, 0))
+    np.testing.assert_array_equal(out.to(Device.DEFAULT).numpy(), full.reshape(2, 4, 512).repeat(2, 0).reshape(16, 512))
+    with self.assertRaises(ValueError): gguf_shard({'w': entry}, devices, {'w': 0}, {'w': 3})
+
   def test_split_quantization_block(self):
     # two devices would each get one and a half Q4_K blocks of every row
     data = Tensor(random_data((8, 768), Q.Q4_K).reshape(-1), device='CPU')
@@ -105,14 +115,16 @@ class TestTensorParallel(unittest.TestCase):
     typ = Q.Q4_K
     data = random_data(shape, typ).reshape(-1)
     w = ggml_data_to_tensor(Tensor(data, device='CPU'), E*O*I, typ).reshape(shape).float().numpy()
-    sel = np.array([[[3, 1]]], dtype=np.int32)
-    for axis in (1, 2):
+    sel, T = np.array([[[3, 1], [0, 2]]], dtype=np.int32), Variable('T', 1, 2).bind(1)
+    for axis in (0, 1, 2):
       with self.subTest(axis=axis):
         layer = ExpertWeights(E, I, O)
         layer.weight = gguf_shard({'w': (Tensor(data, device='CPU'), shape, typ)}, DEVICES, {'w': axis})['w'].half()
-        x = np.random.default_rng(1).normal(size=(1, 1, 1 if axis == 1 else 2, I)).astype(np.float16)
+        x = np.random.default_rng(1).normal(size=(1, 2, 1 if axis == 1 else 2, I)).astype(np.float16)
         ref = np.stack([w[e] @ x[0, 0, j % x.shape[2]].astype(np.float32) for j, e in enumerate(sel[0, 0])])
-        got = layer(Tensor(sel).shard(DEVICES), Tensor(x).shard(DEVICES, 3 if axis == 2 else None)).float().to(Device.DEFAULT).numpy()
+        got = layer(Tensor(sel).shard(DEVICES)[:, :T], Tensor(x).shard(DEVICES, 3 if axis == 2 else None)[:, :T])
+        got = got.pad_to(got.max_shape).float().to(Device.DEFAULT).numpy()
+        if axis == 0: got = got.sum(0)
         self.assertEqual(layer.ggml_type, typ)
         np.testing.assert_allclose(got[0, 0], ref, rtol=2e-2, atol=2e-2*np.abs(ref).max())
 
@@ -121,7 +133,7 @@ class TestTensorParallel(unittest.TestCase):
     rng = np.random.default_rng(42)
     # Keep GQA, partial RoPE, gated attention and replicated SSM state; custom kernels have separate tests.
     config = TransformerConfig(num_blocks=2, dim=8, hidden_dim=8, n_heads=4, n_kv_heads=2, norm_eps=1e-5, vocab_size=16, head_dim=4,
-      v_head_dim=4, rope_theta=10000, rope_dim=2, max_context=4, qk_norm=4, attn_output_gate=True, ssm=SSMConfig(2, 2, 2, 4, 8),
+      v_head_dim=4, rope_theta=10000, rope_dim=2, max_context=4, qk_norm=4, attn_output_gate=True, ssm=SSMConfig(2, 2, 2, 4, 8, silu_gate=True),
       ssm_layers=(True, False))
     with tempfile.TemporaryDirectory() as folder:
       writer = GGUFWriter(path:=pathlib.Path(folder)/'model.gguf', 'qwen35')
@@ -143,7 +155,7 @@ class TestTensorParallel(unittest.TestCase):
       temperature = Tensor([0.0]).realize()
       for pos, expected in enumerate((0, 3)):
         x, start_pos = Tensor([[pos+1]]).realize(), Variable('start_pos', 0, 3).bind(pos)
-        self.assertEqual(parallel.forward(x, start_pos, temperature).item(), expected)
+        self.assertEqual(parallel.forward(x, temperature, start_pos).item(), expected)
       # the kv cache is sharded on its heads, the gated deltanet is copied to every device
       self.assertEqual(parallel.blk[1].cache_kv.uop.axis, 2)
       for t in (parallel.blk[0].attn_qkv.weight, parallel.blk[0].recurrent_state): self.assertEqual((t.device, t.uop.axis), (DEVICES, None))

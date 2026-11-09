@@ -11,7 +11,7 @@ import tinygrad.runtime.support.hcq2 as hcq2
 from tinygrad.runtime.support.hcq2 import HCQInfo
 
 def lower_hcq(*body:UOp) -> UOp: # body through lower_call, as a linear
-  return UOp(Ops.LINEAR, src=(unwrap(hcq2.lower_call(UOp.sink(*body, arg=KernelInfo("test", optimized=True)).call(aux=HCQInfo(("CPU",))))),))
+  return UOp(Ops.LINEAR, src=(unwrap(hcq2.lower_call(UOp.sink(*body, arg=KernelInfo("test", optimized=True)).call(hcq=HCQInfo(("CPU",))))),))
 
 def chain(x:Tensor, n:int) -> Tensor:
   for _ in range(n): x = (x + 1).contiguous()
@@ -39,7 +39,7 @@ def scheduled(*ts:Tensor, **kwargs) -> list[UOp]:
   batches, orig = list[UOp](), hcq2.sched_batches
   def track(l, profile):
     lin = orig(l, profile)
-    batches.extend(c for c in lin.src if c.op is Ops.CALL and isinstance(c.arg.aux, HCQInfo))
+    batches.extend(c for c in lin.src if c.op is Ops.CALL and c.arg.hcq is not None)
     return lin
   with patch.object(hcq2, "sched_batches", track): compile_linear(ts[0].linear_with_vars(*ts[1:])[0], **kwargs)
   return batches
@@ -63,7 +63,7 @@ def word(u:UOp) -> tuple[UOp, int]:
 T = 5 # the timeline value the last submitted batch of every device signals
 def run(batch:UOp, done:dict[str, int]|None=None, prio:list|None=None) -> tuple[list, dict, dict]:
   qs, cs, mem = queues(batch), calls(batch), defaultdict(int)
-  for d in batch.arg.aux.device:
+  for d in batch.arg.hcq.device:
     mem[word(hcq2.timeline(d))] = (done or {}).get(d, T)
     mem[word(hcq2.timeline(d).index(1))] = T
   def val(u:UOp) -> int:
@@ -84,7 +84,7 @@ def run(batch:UOp, done:dict[str, int]|None=None, prio:list|None=None) -> tuple[
       elif c in cs: log.append(cs.index(c))
       cmds.pop(0)
       break
-    else: return log, {q: len(cmds) for q, cmds in qs.items()}, {d: mem[word(hcq2.timeline(d))] for d in batch.arg.aux.device}
+    else: return log, {q: len(cmds) for q, cmds in qs.items()}, {d: mem[word(hcq2.timeline(d))] for d in batch.arg.hcq.device}
 
 def rotations(batch:UOp) -> list[list]: return [(qs:=list(queues(batch)))[i:] + qs[:i] for i in range(len(queues(batch)))]
 def orders(batch:UOp) -> set[tuple[int, ...]]: return {tuple(x for x in run(batch, prio=p)[0] if isinstance(x, int)) for p in rotations(batch)}
@@ -93,7 +93,7 @@ class TestHCQ2Deps(unittest.TestCase):
   def test_dependencies_through_selected_slices(self):
     b = UOp.param(0, dtypes.float32, 64, device=("NULL", "NULL:1"))
     for view in [b.mselect(0).shrink(((8, 16),)), b.shrink(((8, 16),)).mselect(0), b.shrink(((4, 32),)).mselect(0).shrink(((4, 12),))]:
-      tracker = hcq2.DepsTracker()
+      tracker = hcq2.DepsTracker(range(5))
       tracker.access_resources([(view, True)], 0)
       self.assertEqual(tracker.access_resources([(b.mselect(1), False)], 1), [])
       self.assertEqual(tracker.access_resources([(b.mselect(0).shrink(((16, 24),)), False)], 2), [])
@@ -102,7 +102,7 @@ class TestHCQ2Deps(unittest.TestCase):
   def test_disjoint_write_preserves_dependencies(self):
     b = UOp.param(0, dtypes.uint8, 16, device="NULL")
     for write in (False, True):
-      tracker = hcq2.DepsTracker()
+      tracker = hcq2.DepsTracker(range(5))
       tracker.access_resources([(b.shrink(((0, 4),)), write)], 0)
       self.assertEqual(tracker.access_resources([(b.shrink(((4, 8),)), True)], 1), [])
       self.assertEqual(tracker.access_resources([(b.shrink(((0, 4),)), True)], 2), [0])
@@ -110,7 +110,7 @@ class TestHCQ2Deps(unittest.TestCase):
   def test_partial_write_preserves_dependencies(self):
     b = UOp.param(0, dtypes.uint8, 16, device="NULL")
     for write in (False, True):
-      tracker = hcq2.DepsTracker()
+      tracker = hcq2.DepsTracker(range(5))
       tracker.access_resources([(b, write)], 0)
       self.assertEqual(tracker.access_resources([(b.shrink(((4, 12),)), True)], 1), [0])
       self.assertEqual(tracker.access_resources([(b.shrink(((0, 4),)), True)], 2), [0])
@@ -119,16 +119,21 @@ class TestHCQ2Deps(unittest.TestCase):
 
   def test_write_waits_for_all_readers(self):
     b = UOp.param(0, dtypes.uint8, 16, device="NULL")
-    tracker = hcq2.DepsTracker()
+    tracker = hcq2.DepsTracker(range(5))
     self.assertEqual(tracker.access_resources([(b, False)], 0), [])
     self.assertEqual(tracker.access_resources([(b, False)], 1), [])
     self.assertEqual(tracker.access_resources([(b, True)], 2), [0, 1])
     self.assertEqual(tracker.access_resources([(b, False)], 3), [2])
 
+  def test_write_waits_for_latest_reader_per_queue(self):
+    b, tracker = UOp.param(0, dtypes.uint8, 16, device="NULL"), hcq2.DepsTracker("AABAA")
+    for tag, view in enumerate([b, b, b, b.shrink(((0, 8),))]): self.assertEqual(tracker.access_resources([(view, False)], tag), [])
+    self.assertEqual(tracker.access_resources([(b, True)], 4), [1, 2, 3])
+
   def test_aliases_do_not_wait_on_themselves(self):
     b = UOp.param(0, dtypes.uint8, 16, device="NULL")
     for whole, part in ((True, False), (False, True), (True, True)):
-      tracker = hcq2.DepsTracker()
+      tracker = hcq2.DepsTracker(range(5))
       tracker.access_resources([(b, True)], 0)
       self.assertEqual(tracker.access_resources([(b, whole), (b.shrink(((4, 12),)), part)], 1), [0])
       self.assertEqual(tracker.access_resources([(b.shrink(((4, 12),)), True)], 2), [1])
@@ -143,11 +148,11 @@ class TestHCQ2Schedule(unittest.TestCase):
     for prio in rotations(batch):
       log, left, timelines = run(batch, prio=prio)
       self.assertFalse(any(left.values()), f"deadlock, left {left}")
-      for d in batch.arg.aux.device:
+      for d in batch.arg.hcq.device:
         bumps = [i for i, x in enumerate(log) if x == d]
         self.assertEqual((len(bumps), timelines[d]), (1, T + 1), f"{d} must bump its timeline once")
         self.assertTrue(all(i < bumps[0] for i, x in enumerate(log) if isinstance(x, int) and d in devices_of(cs[x])), f"{d} bumps too early")
-    for d in batch.arg.aux.device:
+    for d in batch.arg.hcq.device:
       log = run(batch, done={d: T - 1})[0]
       self.assertFalse([x for x in log if isinstance(x, int) and d in devices_of(cs[x])], f"{d} runs before its previous batch is done")
     return batch

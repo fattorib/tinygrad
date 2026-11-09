@@ -1,11 +1,11 @@
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import cast
 import itertools
 from tinygrad.dtype import dtypes, AddrSpace, Invalid
 from tinygrad.uop.ops import PatternMatcher, UPat, Ops, UOp, resolve, GroupOp, KernelInfo
 from tinygrad.uop.ops import graph_rewrite, sint, AxisType, BottomUpGate, rewrite_group
 from tinygrad.uop.symbolic import symbolic
-from tinygrad.helpers import prod, dedup, DEBUG_RANGEIFY, VIZ, MAX_KERNEL_BUFFERS, SPEC
+from tinygrad.helpers import prod, dedup, VIZ, MAX_KERNEL_BUFFERS, SPEC
 from tinygrad.helpers import get_single_element
 from tinygrad.codegen.simplify import pm_flatten_range, pm_reduce_simplify
 from tinygrad.schedule.indexing import run_rangeify, BufferizeOpts, apply_movement_op
@@ -241,7 +241,8 @@ def flatten_bufferize(x:UOp):
 pm_flatten_bufferize = PatternMatcher([(UPat(Ops.STAGE, name="x"), flatten_bufferize)])
 
 def is_noop_after_dep(x:UOp) -> bool:
-  return (x.op is Ops.NOOP and len(x.src) == 0) or (x.op is Ops.END and is_noop_after_dep(x.src[0]))
+  return (x.op is Ops.NOOP and len(x.src) == 0) or (x.op in (Ops.END, Ops.AFTER) and is_noop_after_dep(x.src[0]) and
+    all(s.op is Ops.RANGE for s in x.src[1:]))
 
 def remove_noop_afters(x:UOp) -> UOp|None:
   src = (x.src[0],) + tuple(s for s in x.src[1:] if not is_noop_after_dep(s))
@@ -289,6 +290,7 @@ def debuf(slot:int, buf:UOp):
 
 def handle_after(ctx:LocalAddBufferContext, after:UOp):
   if after.addrspace == AddrSpace.LOCAL: return None
+  if after.addrspace is AddrSpace.ALU: raise RuntimeError("kernel boundary requires storage")
   buf = after.buf_uop
   # NOTE: this is bottom up, so we only add it once
   if buf not in ctx.map: ctx.map[buf] = after
@@ -311,9 +313,6 @@ to_define_global = PatternMatcher([
   (UPat(Ops.INDEX, src=(UPat(Ops.PARAM, name="v"),)), lambda v: v if v.addrspace == AddrSpace.ALU else None),
 
   (UPat(Ops.AFTER, name="after"), handle_after),
-
-  # remove device from local BUFFERIZE
-  (UPat(Ops.STAGE, name="b"), lambda b: b.replace(arg=replace(b.arg, device=None))),
 
   (UPat(Ops.RANGE, name="r"), lambda ctx, r: ctx.ranges.setdefault(r.arg)),
 ])
@@ -341,7 +340,7 @@ split_kernels = PatternMatcher([
 @rewrite_group(new_ctx=False)
 def get_kernel_graph(tsink:UOp) -> UOp:
   # convert movement ops to ranges
-  tsink = run_rangeify(tsink, bool(DEBUG_RANGEIFY))
+  tsink = run_rangeify(tsink)
 
   # cleanups for speed and runability
   tsink = graph_rewrite(tsink,

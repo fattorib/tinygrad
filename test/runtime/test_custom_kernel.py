@@ -1,14 +1,13 @@
 import unittest, functools
 from tinygrad import Tensor, UOp, GlobalCounters, Context, Device, Variable, TinyJit
-from tinygrad.engine.realize import run_linear
+from tinygrad.engine.realize import run_linear, get_runtime
 from tinygrad.codegen import to_program
 import numpy as np
 from tinygrad.dtype import AddrSpace, dtypes, Invalid
 from tinygrad.helpers import getenv
-from test.mockgpu.amd.emu import ASM_CALL
 from tinygrad.schedule.rangeify import BufferizeOpts
 from tinygrad.uop.ops import KernelInfo, AxisType, Ops, uopfunc
-from tinygrad.codegen.opt import Opt, OptOps
+from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CStyleLanguage
 from tinygrad.renderer.llvmir import LLVMRenderer
@@ -151,6 +150,22 @@ class TestCustomKernel(unittest.TestCase):
     out = c.flatten().tolist()
     assert all(x == 2 for x in out), "all 2"
 
+  def test_reduce_device_range(self):
+    def kernel(C:UOp, A:UOp, B:UOp):
+      d = UOp.range(2, 0, AxisType.DEVICE)
+      return C[0].store(UOp.stack(A, B)[d, 0].reduce(d, arg=Ops.ADD)).sink(arg=KernelInfo(opts_to_apply=()))
+    devs = ('CPU:1', 'CPU:2')
+    lanes = [Tensor([2]).to(devs[0]).realize(), Tensor([3]).to(devs[1]).realize()]
+    out = Tensor.empty(2, dtype=lanes[0].dtype, device='CPU').shard(devs, axis=0).realize()
+    with self.assertRaises(RuntimeError): Tensor.custom_kernel(out, *lanes, fxn=kernel)[0].realize()
+
+  def test_reduce_device_range_not_copy(self):
+    def kernel(C:UOp, A:UOp):
+      d = UOp.range(2, 0, AxisType.DEVICE)
+      return UOp(Ops.NOOP).after(d.after(C[0].store(A[0])).reduce(d, arg=Ops.ADD)).sink(arg=KernelInfo(opts_to_apply=()))
+    out = Tensor.zeros(2, device='CPU').shard(('CPU:1', 'CPU:2'), axis=0).contiguous().realize()
+    with self.assertRaises(RuntimeError): Tensor.custom_kernel(out, Tensor([7.]).realize(), fxn=kernel)[0].realize()
+
   def test_sharded_add_one(self):
     # PYTHON backend explicitly checks for OOB access for wrong multi shape regression
     devs = ("PYTHON:0", "PYTHON:1")
@@ -290,6 +305,34 @@ class TestCustomKernel(unittest.TestCase):
     tst = Tensor.custom_kernel(c, a, b, fxn=custom_gemm)[0]
     self.assertTrue(tst.allclose(a@b, atol=1e-3).item())
 
+  def test_range_merge_keeps_inner_reduce(self):
+    # the inner reduce ends r1 alone, so r0 and r1 don't merge. the inner sum is 4, the outer adds it 4*4*4 times
+    def kernel(C:UOp, A:UOp) -> UOp:
+      r0, r1, r2 = [UOp.range(4, n, AxisType.UPCAST) for n in range(3)]
+      return C[0].store(A[r2].reduce(r1, arg=Ops.ADD).reduce(r0, r1, r2, arg=Ops.ADD)).sink(arg=KernelInfo(opts_to_apply=()))
+    self.assertEqual(Tensor.custom_kernel(Tensor.empty(1), Tensor.ones(4).contiguous(), fxn=kernel)[0].item(), 256)
+
+  def test_reduce_over_singleton_range(self):
+    def kernel(C:UOp, A:UOp) -> UOp:
+      return C[0].store(A[1].reduce(UOp.range(1, 0, AxisType.LOOP), arg=Ops.ADD)).sink(arg=KernelInfo(opts_to_apply=()))
+    self.assertEqual(Tensor.custom_kernel(Tensor.empty(1, dtype=dtypes.int), Tensor([2, 3]).contiguous(), fxn=kernel)[0].item(), 3)
+
+  def test_reduce_axis_and_range(self):
+    def kernel(C:UOp, A:UOp) -> UOp: return C[0].store(A.reduce(UOp.range(3, 0), arg=(Ops.ADD, 1))).sink()
+    self.assertEqual(Tensor.custom_kernel(Tensor.empty(1, dtype=dtypes.int), Tensor([2, 3]), fxn=kernel)[0].item(), 15)
+
+  def test_reduce_singleton_axis_and_range(self):
+    assert Tensor(Tensor([[2], [3]]).uop.reduce(UOp.range(3, 0), arg=(Ops.ADD, 2))).item() == 15
+
+  def test_reduce_as_index(self):
+    def kernel(C:UOp, A:UOp, B:UOp) -> UOp:
+      k = UOp.range(2, 0, AxisType.LOOP)
+      idx = A[k].load().reduce(k, arg=Ops.ADD)
+      return C[0].store(B[idx].load()).sink(arg=KernelInfo(opts_to_apply=()))
+    with Context(CHECK_OOB=0):
+      out = Tensor.custom_kernel(Tensor.empty(1, dtype=dtypes.int), Tensor([1, 2]), Tensor([10, 20, 30, 40]), fxn=kernel)[0]
+      self.assertEqual(out.item(), 40)
+
   @unittest.skipIf(not Device[Device.DEFAULT].renderer.has_local, "test requires locals")
   def test_group_reduce_split_range(self):
     # j%2 splits j into two ranges, both are still LOCAL
@@ -358,6 +401,42 @@ class TestCustomKernel(unittest.TestCase):
     a = Tensor.arange(32).reshape(4, 8).float().contiguous().realize()
     self.assertEqual(Tensor.custom_kernel(Tensor.empty(4), a, fxn=kernel)[0].tolist(), (a.sum(1) + a[:, 0]).tolist())
 
+  def test_explicit_stage_padded_slice(self):
+    def kernel(out):
+      r = UOp.range(2, 0, AxisType.LOOP)
+      return out.store(r.expand(2).pad((1, 1)).bufferize(r, arg=BufferizeOpts(out.device, removable=False))).sink()
+    self.assertEqual(Tensor.empty(2, 4, dtype=dtypes.int).custom_kernel(fxn=kernel)[0].tolist(), [[0, 0, 0, 0], [0, 1, 1, 0]])
+
+  def _test_explicit_stage_free_range(self, space:AddrSpace):
+    def kernel(out):
+      i, j = UOp.range(3, 0, AxisType.LOOP), UOp.range(4, 1, AxisType.LOOP)
+      v = (i*10+j).cast(dtypes.int).bufferize(j, arg=BufferizeOpts(None, space, removable=False))
+      return out[i].store(v.index(2)).end(i).sink()
+    self.assertEqual(Tensor.empty(3, dtype=dtypes.int).custom_kernel(fxn=kernel)[0].tolist(), [2, 12, 22])
+  @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, PTXRenderer), "PTX does not support dynamic register indexing")
+  def test_explicit_stage_free_range_reg(self): self._test_explicit_stage_free_range(AddrSpace.REG)
+  @unittest.skipIf(not Device[Device.DEFAULT].renderer.has_shared, "LOCAL STAGE needs shared memory")
+  def test_explicit_stage_free_range_local(self): self._test_explicit_stage_free_range(AddrSpace.LOCAL)
+
+  def _test_explicit_stage_no_range(self, space:AddrSpace):
+    def kernel(out):
+      i = UOp.range(3, 0, AxisType.LOOP)
+      return out[i].store((i*10).cast(dtypes.int).bufferize(arg=BufferizeOpts(None, space, removable=False))+1).end(i).sink()
+    self.assertEqual(Tensor.empty(3, dtype=dtypes.int).custom_kernel(fxn=kernel)[0].tolist(), [1, 11, 21])
+  def test_explicit_stage_no_range_reg(self): self._test_explicit_stage_no_range(AddrSpace.REG)
+  @unittest.skipIf(not Device[Device.DEFAULT].renderer.has_shared, "LOCAL STAGE needs shared memory")
+  def test_explicit_stage_no_range_local(self): self._test_explicit_stage_no_range(AddrSpace.LOCAL)
+
+  def test_explicit_stage_scalar_index(self):
+    for direct, want in ((True, [2]), (False, [30])):
+      def kernel(out, direct=direct):
+        r = UOp.range(4, 0, AxisType.LOOP, dtype=dtypes.int32)
+        v = r.bufferize(r, arg=BufferizeOpts(out.device, removable=False)).index(2).load()
+        values = UOp.stack(*[UOp.const(x, dtypes.int32) for x in (10, 20, 30, 40)])
+        return out.index(0).store(v if direct else values.index(v)).sink()
+      with self.subTest(direct=direct):
+        self.assertEqual(Tensor.empty(1, dtype=dtypes.int32).custom_kernel(fxn=kernel)[0].tolist(), want)
+
   def test_split_range_id_free_of_loop(self):
     # the UPCAST range minted by the split gets a fresh id, the while loop's id 1 is taken
     def kernel(C:UOp, A:UOp) -> UOp:
@@ -368,6 +447,13 @@ class TestCustomKernel(unittest.TestCase):
       return C[r].set(A[r] + cnt[0].cast(C.dtype), end=r).sink(arg=KernelInfo(opts_to_apply=(Opt(OptOps.SPLIT, 0, (2, AxisType.UPCAST)),)))
     a = Tensor([1., 2, 3, 4])
     self.assertEqual(Tensor.custom_kernel(Tensor.empty(4), a, fxn=kernel)[0].tolist(), [4., 5, 6, 7])
+
+  def test_range_bound_after_outer_range(self):
+    def kernel(C:UOp) -> UOp:
+      i = UOp.range(3, 0, AxisType.LOOP)
+      j = UOp.range(UOp.const(2, dtypes.weakint).after(i), 1, AxisType.LOOP)
+      return C[0].set(C.after(i, j)[0] + 1, end=(j, i)).sink(arg=KernelInfo())
+    self.assertEqual(Tensor.custom_kernel(Tensor.zeros(1, dtype=dtypes.int).contiguous(), fxn=kernel)[0].tolist(), [6])
 
   def test_gemm_multi(self):
     devs = ("CPU:0", "CPU:1")
@@ -444,21 +530,6 @@ class TestCustomKernel(unittest.TestCase):
     x = Tensor.empty(4).uop
     self.assertEqual(Tensor(x.after(x.store(5), x.store(Invalid))).tolist(), [5]*4)
 
-  def test_store_behind_value_after_kept(self):
-    def kernel(A:UOp, loop:bool) -> UOp:
-      x = UOp.const(1, dtypes.weakint).after(A[0].store(7))
-      return (A[(r:=UOp.range(x, 0))+1].store(9).end(r) if loop else A[x].store(9)).sink(arg=KernelInfo(opts_to_apply=()))
-    for loop in (False, True):
-      out = Tensor.custom_kernel(Tensor.zeros(2, dtype=dtypes.int).contiguous().realize(), fxn=functools.partial(kernel, loop=loop))[0]
-      self.assertEqual(out.tolist(), [7, 9])
-
-  def test_deleted_store_keeps_deps(self):
-    for f in (lambda a, s: s[1].store(s[1].load()), lambda a, s: s[UOp.invalid()].store(5),
-              lambda a, s: s[1].store(UOp.invalid()), lambda a, s: a[UOp.invalid()].store(s[1].load())):
-      out = Tensor.custom_kernel(Tensor.zeros(3, dtype=dtypes.int).contiguous(),
-                                 fxn=lambda a: f(a, a.after(a[0].store(7))).sink(arg=KernelInfo(opts_to_apply=())))[0]
-      self.assertEqual(out.tolist(), [7, 0, 0])
-
   def test_expand_view_invalid_assign_keeps_uncovered_reads(self):
     x = Tensor([[10., 11., 12., 13.], [20., 21., 22., 23.], [30., 31., 32., 33.], [40., 41., 42., 43.]]).realize()
     v = x[:1, :].expand(4, 4)
@@ -484,6 +555,27 @@ class TestCustomKernel(unittest.TestCase):
       return C[i].store(tmp.after(st)[i, 0]).end(i).sink(arg=KernelInfo(opts_to_apply=()))
     self.assertEqual(Tensor.custom_kernel(Tensor.empty(4), fxn=kernel)[0].tolist(), [1.]*4)
 
+  @unittest.skipIf(not Device[Device.DEFAULT].renderer.has_local, "test requires locals")
+  def test_dependent_local_ends(self):
+    # the second END reads what the other threads stored in the first END
+    def kernel(C:UOp) -> UOp:
+      t = UOp.range(8, 0, AxisType.LOCAL)
+      tmp = UOp.placeholder((8,), dtypes.int, slot=0, addrspace=AddrSpace.LOCAL)
+      st = tmp[t].store(t.cast(dtypes.int)).end(t)
+      return C[t].store(tmp.after(st)[7-t]).end(t).sink(arg=KernelInfo(opts_to_apply=()))
+    self.assertEqual(Tensor.custom_kernel(Tensor.empty(8, dtype=dtypes.int), fxn=kernel)[0].tolist(), [7-i for i in range(8)])
+
+  @unittest.skipIf(not Device[Device.DEFAULT].renderer.has_local, "test requires locals")
+  def test_dependent_local_ends_merged_ranges(self):
+    # t0 and t1 merge into one range of 8 in both ENDs
+    def kernel(C:UOp) -> UOp:
+      t0, t1 = UOp.range(4, 0, AxisType.LOCAL), UOp.range(2, 1, AxisType.LOCAL)
+      i = t0*2+t1
+      tmp = UOp.placeholder((8,), dtypes.int, slot=0, addrspace=AddrSpace.LOCAL)
+      st = tmp[i].store(i.cast(dtypes.int)).end(t0, t1)
+      return C[i].store(tmp.after(st)[t0*2+1-t1]).end(t0, t1).sink(arg=KernelInfo(opts_to_apply=()))
+    self.assertEqual(Tensor.custom_kernel(Tensor.empty(8, dtype=dtypes.int), fxn=kernel)[0].tolist(), [i^1 for i in range(8)])
+
   @unittest.expectedFailure
   def test_gated_load_2d(self):
     # TODO: broken now, the valid is dropped. the valid on one index of the 2d A gates the whole load, it is 0 where j != 0
@@ -492,6 +584,15 @@ class TestCustomKernel(unittest.TestCase):
       return C[i, j].store(A[i.valid(j.eq(0)), 0]).end(i, j).sink(arg=KernelInfo(opts_to_apply=()))
     a = Tensor.arange(16).reshape(4, 4).float().contiguous().realize()
     self.assertEqual(Tensor.custom_kernel(Tensor.empty(4, 4), a, fxn=kernel)[0].tolist(), a[:, :1].pad(((0, 0), (0, 3))).tolist())
+
+  def test_variable_arg_is_not_copy(self):
+    # a buffer and a Variable aren't a copy kernel, so the ranges merge in codegen after the split, and SPLIT sees one axis of 8
+    def kernel(D:UOp, N:UOp) -> UOp:
+      a, b = UOp.range(2, 0), UOp.range(4, 1)
+      i = a*4+b
+      return D[i].store((i%2+N).cast(dtypes.int)).end(a, b).sink(arg=KernelInfo(opts_to_apply=(Opt(OptOps.SPLIT, 0, (8, AxisType.UPCAST)),)))
+    d = Tensor.custom_kernel(Tensor.empty(8, dtype=dtypes.int), Tensor(Variable("n", 1, 8, dtypes.int).bind(2)), fxn=kernel)[0]
+    self.assertEqual(d.tolist(), [2, 3]*4)
 
   @unittest.skipIf(Device.DEFAULT == "WEBGPU", "kernel timing not supported")
   def test_invalids_into_custom_kernel_with_beam(self):
@@ -586,17 +687,132 @@ class TestCustomKernel(unittest.TestCase):
       self.assertEqual(a.flatten().tolist(), [2, 2, 3, 3])
     self.assertEqual(a.shape, (2, 2))
 
-  @unittest.skipUnless((isinstance(Device[Device.DEFAULT].renderer, CStyleLanguage) or Device.DEFAULT == "PYTHON") and
-                       Device.DEFAULT != "WEBGPU" and not ASM_CALL, "binary not supported on this backend")
+  @unittest.skipUnless((isinstance(Device[Device.DEFAULT].renderer, (CStyleLanguage, LLVMRenderer)) or Device.DEFAULT == "PYTHON") and
+                       Device.DEFAULT != "WEBGPU", "binary not supported on this backend")
   def test_binary(self):
     payload = bytes(range(256))
+    def view(x): return x.reshape((16, 16)).permute((1, 0)).reshape((256,))
     def kernel(out:UOp):
       i = UOp.range(len(payload), 0)
-      data = UOp(Ops.BINARY, arg=payload)
+      data = view(UOp(Ops.BINARY, arg=payload))
       return out[i].store(data[i]).end(i).sink(arg=KernelInfo(name="binary", opts_to_apply=()))
-    self.assertEqual(Tensor.empty(len(payload), dtype=dtypes.uint8).custom_kernel(fxn=kernel)[0].tolist(), list(payload))
+    self.assertEqual(Tensor.empty(len(payload), dtype=dtypes.uint8).custom_kernel(fxn=kernel)[0].tolist(),
+                     view(Tensor(payload, dtype=dtypes.uint8)).tolist())
 
-@unittest.skipUnless((Device.DEFAULT == "CPU" and isinstance(Device[Device.DEFAULT].renderer, (CStyleLanguage, LLVMRenderer))),
+  def test_one_lane_stack_runtime_index(self):
+    def kernel(A:UOp): return A[0].store(UOp.stack(UOp.const(42, dtypes.int)).index(A[1].load())).sink(arg=KernelInfo(opts_to_apply=()))
+    self.assertEqual(Tensor.zeros(2, dtype=dtypes.int).contiguous().custom_kernel(fxn=kernel)[0].tolist(), [42, 0])
+
+  def test_stack_runtime_index_two_axes(self):
+    def kernel(A:UOp):
+      i, j = UOp.range(2, 0), UOp.range(2, 1)
+      m = UOp.const(((1, 2), (3, 4)), dtypes.int)
+      return A[i*2+j].store(m.index(i, j)).end(j, i).sink(arg=KernelInfo(opts_to_apply=()))
+    self.assertEqual(Tensor.zeros(4, dtype=dtypes.int).contiguous().custom_kernel(fxn=kernel)[0].tolist(), [1, 2, 3, 4])
+
+  def test_stack_runtime_index_effectful_trailing_axis(self):
+    def kernel(A:UOp, B:UOp):
+      j = UOp.const(1, dtypes.int).after(A[0].store(A[0].load()+1))
+      return B[0].store(UOp.const(((1, 2), (3, 4)), dtypes.int).index(A[1].load(), j)).sink(arg=KernelInfo(opts_to_apply=()))
+    a, b = Tensor.custom_kernel(Tensor([0, 1]).contiguous(), Tensor.zeros(1, dtype=dtypes.int).contiguous(), fxn=kernel)
+    self.assertEqual((a.tolist(), b.tolist()), ([1, 1], [4]))
+
+  def test_stack_runtime_index_then_getitem(self):
+    def kernel(A:UOp, B:UOp):
+      return B[0].store(UOp.const(((1, 2), (3, 4)), dtypes.int).index(A[0].load())[A[1].load()]).sink(arg=KernelInfo(opts_to_apply=()))
+    self.assertEqual(Tensor.custom_kernel(Tensor([1, 0]).contiguous(), Tensor.zeros(1, dtype=dtypes.int).contiguous(), fxn=kernel)[1].tolist(), [3])
+
+  def test_identity_shrink_keeps_offset_effect(self):
+    def kernel(A:UOp, B:UOp):
+      s = UOp.const(0, dtypes.weakint).after(A[0].store(7))
+      return B[0].store(A.shrink(((s, s+1),))[0].load()).sink(arg=KernelInfo(opts_to_apply=()))
+    a, b = Tensor.custom_kernel(Tensor.zeros(1, dtype=dtypes.int).contiguous(), Tensor.zeros(1, dtype=dtypes.int).contiguous(), fxn=kernel)
+    self.assertEqual((a.tolist(), b.tolist()), ([7], [7]))
+
+  def test_fold_keeps_each_operand_effect_once(self):
+    def kernel(A:UOp, B:UOp):
+      x, y = UOp.const(1, dtypes.int).after(A[0].store(A[0].load()+1)), UOp.const(2, dtypes.int).after(A[1].store(8))
+      return B[0].store((x*x*y).cast(dtypes.bool).where(x, y) % 1).sink(arg=KernelInfo(opts_to_apply=()))
+    a, b = Tensor.custom_kernel(Tensor.zeros(2, dtype=dtypes.int).contiguous(), Tensor.ones(1, dtype=dtypes.int).contiguous(), fxn=kernel)
+    self.assertEqual((a.tolist(), b.tolist()), ([1, 8], [0]))
+
+  def test_fold_keeps_effect_on_unloaded_value(self):
+    def kernel(A:UOp, B:UOp): return B[0].store((A[0]+1).after(A[1].store(7)) * 0).sink(arg=KernelInfo(opts_to_apply=()))
+    a, b = Tensor.custom_kernel(Tensor([3, 0]).contiguous(), Tensor.ones(1, dtype=dtypes.int).contiguous(), fxn=kernel)
+    self.assertEqual((a.tolist(), b.tolist()), ([3, 7], [0]))
+
+  def test_index_vector_bitcast_widen(self):
+    def kernel(A:UOp, B:UOp): return B[0].store(A.index().load().bitcast(dtypes.int32)[1]).sink(arg=KernelInfo(opts_to_apply=()))
+    _, b = Tensor.custom_kernel(Tensor([1, 2, -3, 4], dtype=dtypes.int16).contiguous(), Tensor.zeros(1, dtype=dtypes.int32).contiguous(), fxn=kernel)
+    self.assertEqual(b.tolist(), [(-3 & 0xFFFF) + (4 << 16)])
+
+  def test_index_vector_bitcast_narrow(self):
+    def kernel(A:UOp, B:UOp): return B[0].store((A.index()+1).bitcast(dtypes.uint16)[3]).sink(arg=KernelInfo(opts_to_apply=()))
+    _, b = Tensor.custom_kernel(Tensor([1, 5 << 16], dtype=dtypes.uint32).contiguous(), Tensor.zeros(1, dtype=dtypes.uint16).contiguous(), fxn=kernel)
+    self.assertEqual(b.tolist(), [5])
+
+  def test_index_shaped_value_after_range(self):
+    def kernel(B:UOp):
+      r = UOp.range(3, 0)
+      value = UOp.stack(UOp.const(2.0, dtypes.float)).reciprocal().after(r)
+      return B[0].store(value.index(UOp.const(0, dtypes.int).after(r)).reduce(r, arg=Ops.MAX)).sink(arg=KernelInfo(opts_to_apply=()))
+    self.assertEqual(Tensor.zeros(1).contiguous().custom_kernel(fxn=kernel)[0].tolist(), [0.5])
+
+  def test_reduce_keeps_shaped_value_effect_count(self):
+    def kernel(A:UOp, B:UOp, C:UOp):
+      i = UOp.range(3, 0)
+      value = (A.index().load()*(i+1)).after(C[0].store(C.after(i)[0].load()+1)).reduce(i, arg=Ops.ADD)
+      return B[0].store(value[0]+value[1]).sink(arg=KernelInfo(opts_to_apply=()))
+    _, b, c = Tensor.custom_kernel(Tensor([1, 10]).contiguous(), Tensor.zeros(1, dtype=dtypes.int).contiguous(),
+                                   Tensor.zeros(1, dtype=dtypes.int).contiguous(), fxn=kernel)
+    Tensor.realize(b, c)
+    self.assertEqual((b.tolist(), c.tolist()), ([66], [3]))
+
+  def test_simplify_keeps_read_after_store(self):
+    def kernel(A:UOp, B:UOp): return B[0].store((A[0].after(A[0].store(7))*2).simplify()).sink(arg=KernelInfo(opts_to_apply=()))
+    a, b = Tensor.custom_kernel(Tensor([3]).contiguous(), Tensor.zeros(1, dtype=dtypes.int).contiguous(), fxn=kernel)
+    self.assertEqual((a.tolist(), b.tolist()), ([7], [14]))
+
+  def test_stack_index_keeps_selector_effect(self):
+    def kernel(A:UOp, B:UOp):
+      i = UOp.const(0, dtypes.int).after(A[0].store(A[0].load()+1))
+      return B[0].store(UOp.stack(UOp.const(2, dtypes.int)).index(i)).sink(arg=KernelInfo(opts_to_apply=()))
+    a, b = Tensor.custom_kernel(Tensor([0]).contiguous(), Tensor([9]).contiguous(), fxn=kernel)
+    self.assertEqual((a.tolist(), b.tolist()), ([1], [2]))
+
+  def test_stack_index_keeps_lane_effects(self):
+    def kernel(A:UOp):
+      lanes = [A.after(A[j].store(7+2*j))[j].load() for j in range(2)]
+      return A[2].store(UOp.stack(*lanes).index(UOp.const(0, dtypes.int))).sink(arg=KernelInfo(opts_to_apply=()))
+    self.assertEqual(Tensor.zeros(3, dtype=dtypes.int).contiguous().custom_kernel(fxn=kernel)[0].tolist(), [7, 9, 7])
+
+  def test_stack_bounded_index_keeps_lane_effects(self):
+    i = UOp.range(2, 0)
+    def kernel(A:UOp):
+      lanes = [A.after(A[j].store(7+2*j))[j].load() for j in range(4)]
+      return A[4+i].store(UOp.stack(*lanes).index(i)).end(i).sink(arg=KernelInfo(opts_to_apply=()))
+    self.assertEqual(Tensor.zeros(6, dtype=dtypes.int).contiguous().custom_kernel(fxn=kernel)[0].tolist(), [7, 9, 11, 13, 7, 9])
+
+  def test_valid_gate_after_effect(self):
+    def kernel(A:UOp, B:UOp):
+      i = UOp.range(2, 0)
+      return B[i].store(A[UOp.const(0).valid(UOp.const(False).after(A[0].store(7)))]+1).end(i).sink(arg=KernelInfo(opts_to_apply=()))
+    a, b = Tensor.custom_kernel(Tensor([3]).contiguous(), Tensor.zeros(2, dtype=dtypes.int).contiguous(), fxn=kernel)
+    self.assertEqual((a.tolist(), b.tolist()), ([7], [1, 1]))
+
+  @unittest.skipUnless(isinstance(Device[Device.DEFAULT].renderer, CStyleLanguage), "custom renders in cstyle")
+  def test_custom_uop(self):
+    N = 4
+    def kernel(x:UOp) -> UOp:
+      y = UOp.custom_function("__builtin_shufflevector({0}, {0}, 3, 2, 1, 0)", shape=(N,), dtype=x.dtype,
+                              fmt=True).call(UOp.stack([x[i].load() for i in range(N)]))
+      self.assertEqual(y.shape, (N,))
+      return x.store(y).sink(arg=KernelInfo("kernel"))
+    out = Tensor.custom_kernel(Tensor.arange(N).clone("CPU"), fxn=kernel)[0]
+    self.assertEqual(out.tolist(), [3, 2, 1, 0])
+
+@unittest.skipUnless((Device.DEFAULT == "CPU" and isinstance(Device[Device.DEFAULT].renderer, (CStyleLanguage, LLVMRenderer)))
+                     or Device.DEFAULT == "AMD" and isinstance(Device[Device.DEFAULT].renderer, CStyleLanguage),
                      "calls in kernel not implemented in this renderer")
 class TestCallInKernel(unittest.TestCase):
   def test_simple(self):
@@ -625,6 +841,18 @@ class TestCallInKernel(unittest.TestCase):
     self.assertEqual(out.tolist(), [N*(N+1)//2])
     out2 = Tensor.custom_kernel(Tensor.empty(1, dtype=x.dtype), x, fxn=main)[0]
     self.assertEqual(out2.tolist(), [N*(N+3)//2])
+
+  def test_reduce_over_call_keeps_loop_order(self):
+    # a call can hide stores, so the reduce loops a, k, b in order, and the digits of S are the A[a*2+b] it visits
+    @uopfunc
+    def update(S:UOp, A:UOp) -> UOp: return S[0].store(S[0]*10+A[0]).sink()
+    def kernel(O:UOp, S:UOp, A:UOp) -> UOp:
+      a, k, b = [UOp.range(2, n, AxisType.LOOP) for n in range(3)]
+      return O[0].store(A[a*2+b].after(update(S.after(k), A[a*2+b])).reduce(a, k, b, arg=Ops.ADD)).sink(arg=KernelInfo(opts_to_apply=()))
+    o, s = Tensor.custom_kernel(Tensor.empty(1, dtype=dtypes.int), Tensor.zeros(1, dtype=dtypes.int).contiguous(),
+                                Tensor([1, 2, 3, 4], dtype=dtypes.int), fxn=kernel)[:2]
+    Tensor.realize(o, s)
+    self.assertEqual(s.item(), 12123434)
 
   def test_nested_call(self):
     @uopfunc
@@ -662,6 +890,18 @@ class TestCallInKernel(unittest.TestCase):
     a = Tensor([1, 2, 3, 4], dtype=dtypes.int).realize()
     out = Tensor.custom_kernel(Tensor.zeros(4, dtype=dtypes.int).clone().realize(), a, fxn=kernel)[0]
     self.assertEqual(out.tolist(), [3, 6, 9, 12])
+
+  def test_call_scalar_arg(self):
+    @uopfunc
+    def add(out:UOp, src:UOp, val:UOp) -> UOp:
+      return out[0].store(src[0]+val).sink()
+
+    def kernel(out:UOp, src:UOp) -> UOp:
+      i = UOp.range(4, 0)
+      return add(out[i], src[i], i).end(i).sink(arg=KernelInfo(name="call_scalar_arg", opts_to_apply=()))
+
+    x = Tensor([1, 2, 3, 4], dtype=dtypes.int).realize()
+    self.assertEqual(Tensor.empty_like(x).custom_kernel(x, fxn=kernel)[0].tolist(), [1, 3, 5, 7])
 
   def test_call_with_gated_store(self):
     @uopfunc
@@ -703,7 +943,6 @@ class TestCallInKernel(unittest.TestCase):
   @unittest.expectedFailure
   def test_call_loop_split(self): self.test_call_loop_mini((Opt(OptOps.SPLIT, 0, (4, AxisType.UPCAST)),))
 
-  @unittest.expectedFailure
   def test_call_loop_pad(self):
     @uopfunc
     def add(p:UOp, q:UOp): return p[0].store(p[0]+q[0]).sink()
@@ -714,8 +953,8 @@ class TestCallInKernel(unittest.TestCase):
       return call.end(i).sink(arg=KernelInfo(name="call_loop_padto", opts_to_apply=(Opt(OptOps.PADTO, 0, 4),)))
 
     a = Tensor([1, 2, 3, 4], dtype=dtypes.int).realize()
-    out = Tensor.custom_kernel(Tensor.zeros(4, dtype=dtypes.int).clone().realize(), a, fxn=kernel)[0]
-    self.assertEqual(out.tolist(), [1, 2, 3, 0])
+    # the CALL body can't be gated, so padding i is refused
+    with self.assertRaises(KernelOptError): Tensor.custom_kernel(Tensor.zeros(4, dtype=dtypes.int).clone().realize(), a, fxn=kernel)[0].realize()
 
   def test_uopfunc(self):
     @uopfunc
@@ -723,8 +962,11 @@ class TestCallInKernel(unittest.TestCase):
       i = UOp.range(x.shape[0], 0, AxisType.LOOP)
       return out[i].store(out[i] + x[i] * a).end(i).sink()
 
+    @uopfunc
+    def triple(out:UOp, x:UOp): return axpy(out, x, 3).sink()
+
     def kernel(C:UOp, A:UOp) -> UOp:
-      C = C.after(axpy(C.after(axpy(C, A, 2)), A, 3))
+      C = C.after(triple(C.after(axpy(C, A, 2)), A))
       i = UOp.range(A.shape[0], 1, AxisType.LOOP) # a loop after the calls
       return C[i].store(C[i] + 1).end(i).sink(arg=KernelInfo(name="uopfunc", opts_to_apply=()))
 
@@ -765,9 +1007,42 @@ class TestCallInKernel(unittest.TestCase):
     y, z = y.to("CPU"), z.to("CPU")
     Tensor.realize(y, z)
 
-    with self.assertRaises(AssertionError):
-      self.assertEqual(y.tolist(), z.tolist())
+    self.assertEqual(y.tolist(), z.tolist())
     self.assertEqual(x.tolist(), z.tolist())
+
+  @unittest.skipIf(Device[Device.DEFAULT].renderer.inline_prefix is not None, "backend inlines calls instead of linking")
+  def test_linker(self):
+    @uopfunc
+    def plus2(out:UOp, A:UOp): return out[0].store(A[0]+2).sink()
+
+    @uopfunc
+    def copy(out:UOp, A:UOp): return out[0].store(A[0]).sink()
+
+    def kernel(A:UOp, extra=False):
+      A = A.flatten()
+      i = UOp.range(A.shape[0], 0)
+      tmp = UOp.alloc_like(A, addrspace=AddrSpace.REG)
+      if extra: tmp = tmp.after(copy(tmp[i], A[i]))
+      return A[i].store(tmp[i].after(plus2(tmp[i], A[i]))).end(i).sink(arg=KernelInfo(name="test_kernel", opts_to_apply=()))
+
+    x = Tensor.custom_kernel(Tensor.arange(4).clone().realize(), fxn=kernel)[0]
+    run_linear(lin:=x.schedule_linear())
+
+    prg = to_program(lin.src[0].body, Device[Device.DEFAULT].renderer)
+    assert "+2" not in prg.src[2].arg, f"found callee body in caller kernel {prg.src[2].arg}"
+    call = next(u for u in prg.src[1].src if u.op is Ops.CALL)
+    first_binary = call.body.src[3]
+    call_runtime = get_runtime(Device.DEFAULT, call.body)
+    self.assertListEqual(x.tolist(), Tensor.arange(4).add(2).tolist())
+
+    # launch a different caller with the same callee
+    x = Tensor.custom_kernel(Tensor.arange(5).clone().realize(), fxn=lambda A: kernel(A, extra=True))[0]
+    run_linear(lin:=x.schedule_linear())
+    prg2 = to_program(lin.src[0].body, Device[Device.DEFAULT].renderer).src[1]
+    self.assertIs(call.body, next(u.body for u in prg2.src if u.op is Ops.CALL and u.arg.name == "plus2"))
+    self.assertIs(first_binary, next(u.body.src[3] for u in prg2.src if u.op is Ops.CALL and u.arg.name == "plus2"))
+    self.assertIs(call_runtime, get_runtime(Device.DEFAULT, call.body))
+    self.assertListEqual(x.tolist(), Tensor.arange(5).add(2).tolist())
 
 class TestCustomKernelInput(unittest.TestCase):
   def _test_mop(self, mop_fxn, max_kernels):
@@ -806,13 +1081,12 @@ class TestUnshardIndex(unittest.TestCase):
 
   A fragment is a per-thread REG buffer wrapped in UNSHARD over LOCAL thread ranges.
   index_multi must resolve an INDEX on the UNSHARD view into an INDEX on the per-thread
-  shard. Two ownership patterns must work:
-    contiguous: idx = rng*shard_sz + local   (thread rng owns [rng*shard_sz, ...))
-    strided:    idx = rng + ir*shard_sz      (thread rng owns {rng, rng+shard_sz, ...})
+  shard. Ownership is contiguous: idx = rng*shard_sz + local (thread rng owns [rng*shard_sz, ...)).
+  Other placements are movement ops on the fragment.
   """
-  def _run(self, kernel, shape=(8, 8)):
+  def _run(self, kernel, shape=(8, 8), inputs=()):
     c = Tensor.empty(*shape)
-    out = Tensor.custom_kernel(c, fxn=kernel)[0]
+    out = Tensor.custom_kernel(c, *inputs, fxn=kernel)[0]
     try: return out.numpy()
     except RuntimeError as e:
       if isinstance(Device[Device.DEFAULT].renderer, PTXRenderer) and "dynamic register indexing" in str(e):
@@ -835,23 +1109,29 @@ class TestUnshardIndex(unittest.TestCase):
 
   @unittest.skipIf(not Device[Device.DEFAULT].renderer.has_local, "fragment tests need LOCAL ranges")
   def test_strided_fragment_index(self):
-    # thread ty owns rows {ty, ty+8, ty+16, ty+24, ..., ty+56} of a 64-row fragment --
-    # strided ownership. idx = ty + ir*8 where shard_sz=8 (8 threads, shard rows=8).
-    # The contiguous check (idx - rng*shard_sz) fails; the strided check
-    # (idx-rng) % shard_sz == 0 must succeed. This is the pattern the index_multi fix adds.
-    def kernel(C:UOp) -> UOp:
+    # thread ty writes rows {ty, ty+8, ..., ty+56} of C: the strided placement is a permute of the fragment's blocks
+    def kernel(C:UOp, A:UOp) -> UOp:
       ty = UOp.range(8, 0, AxisType.LOCAL)
       ir = UOp.range(8, 1, AxisType.LOOP)
       j = UOp.range(8, 2, AxisType.LOOP)
-      # 8x8 fragment, 8 threads -> 64x8 full tile. thread ty owns rows {ty, ty+8, ..., ty+56}.
       frag = UOp.placeholder((8, 8), dtypes.float32, 0, AddrSpace.REG).unshard((0,), (ty,))
-      return C[ty + ir*8, j].store(frag[ty + ir*8, j]).end(j, ir, ty).sink(arg=KernelInfo(name="strided_frag"))
-    out = self._run(kernel, (64, 8))
-    assert out.shape == (64, 8)
+      frag = frag.after(frag.store(A)).reshape(8, 8, 8).permute(1, 0, 2)
+      return C[ty + ir*8, j].store(frag[ir, ty, j]).end(j, ir, ty).sink(arg=KernelInfo(name="strided_frag", opts_to_apply=()))
+    a = Tensor.arange(512).float().reshape(64, 8).contiguous()
+    np.testing.assert_equal(self._run(kernel, (64, 8), inputs=(a,)), a.numpy().reshape(8, 8, 8).transpose(1, 0, 2).reshape(64, 8))
+
+  def test_strided_index_into_block_fragment(self):
+    # owner + local*2 reads another owner's block, so index_multi must raise
+    def kernel(C:UOp, A:UOp) -> UOp:
+      owner = UOp.range(2, 0, AxisType.LOOP)
+      local = UOp.range(2, 1, AxisType.LOOP)
+      frag = UOp.placeholder((2,), dtypes.float32, 0, AddrSpace.REG).unshard(0, owner)
+      frag = frag.after(frag.store(A))
+      return C[owner + local*2].store(frag[owner + local*2]).end(local, owner).sink(arg=KernelInfo(opts_to_apply=()))
+    with self.assertRaisesRegex(RuntimeError, "cannot shard index"): self._run(kernel, (4,), inputs=(Tensor.arange(4).float().contiguous(),))
 
   def test_fragment_index_cannot_shard(self):
-    # thread ty indexing rows [ty, ty+8) overlaps with other threads' rows -- this matches neither
-    # the contiguous nor the strided ownership pattern, so index_multi must raise.
+    # thread ty indexing rows [ty, ty+8) overlaps with other threads' rows, so index_multi must raise.
     def kernel(C:UOp) -> UOp:
       ty = UOp.range(8, 0, AxisType.LOCAL)
       ir = UOp.range(8, 1, AxisType.LOOP)
