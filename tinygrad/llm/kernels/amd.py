@@ -524,7 +524,6 @@ def _quant_linear_f16_wmma_kernel(out:UOp, raw:UOp, x:UOp, *grids:UOp,
                             layout, dequant, f"linear_{QUANT_NAMES[ggml_type]}_f16_wmma", kgroups, lanes)
 
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
-  assert layer.ggml_type in QUANT_SIZES
   tokens = int(x.numel()) // layer.in_features
   out_features, in_features = layer.out_features, int(x.uop.shard_shape[-1])
   splits = layer.in_features // in_features
