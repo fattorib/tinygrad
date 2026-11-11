@@ -97,6 +97,12 @@ decode    127:   9.51 ms,   105.12 tok/s,  122.72 GB/s, 1167/7556 MB
 ```
 
 
+7. JIT the CPU copybacks -> one less HCQ submit which adds overhead of ~1ms
+```JITBEAM=1
+prefill  2500: 3787.65 ms,   660.04 tok/s,   41.53 GB/s, 157307/7320 MB  --
+decode    127:   7.81 ms,   128.05 tok/s,  204.67 GB/s, 1598/7323 MB  --  1203 1204 1205 1206 1207 1208 1209
+```
+
 
 Issues now:
 1. Cache just gets randomly invalidated sometimes (when it should persist):
@@ -144,4 +150,13 @@ Faster tinygrad top-k:
 ```JITBEAM=1
 prefill  2500: 3310.61 ms,   755.15 tok/s,   47.52 GB/s, 157307/7320 MB  -- 
 decode    127:   8.26 ms,   121.07 tok/s,  193.52 GB/s, 1598/7323 MB  --  1203 1204 1205 1206 1207 1208 1209
+```
+
+
+# Can we drop .contiguous()?
+- Removed in SwiGLU
+
+```JITBEAM=1
+prefill  2500: 3239.65 ms,   771.69 tok/s,   48.56 GB/s, 157307/7354 MB  --
+decode    127:   8.79 ms,   113.82 tok/s,  181.93 GB/s, 1598/7357 MB  --  1203 1204 1205 1206 1207 1208 1209
 ```
