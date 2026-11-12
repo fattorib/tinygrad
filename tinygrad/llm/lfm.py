@@ -243,9 +243,11 @@ class Transformer:
     # only run the output projection on the last token
     logits = self.output(self.output_norm(x[:, -1:]))[:, -1, :].to(self.token_embd.weight.device)
     # Gumbel-max trick: argmax(logits/temp - log(-log(uniform))) is equivalent to sampling from softmax(logits/temp)
-    vals, indices = logits.topk(k = topk, dim=-1)
-    k = (vals / temperature.maximum(1e-12) - (Tensor.rand_like(vals).maximum(1e-12).log().neg()).log()).argmax(axis = -1, keepdim=True)
-    return indices.gather(-1, k).to('CPU')
+    if topk > 1:
+      vals, indices = logits.topk(k = topk, dim=-1)
+      k = (vals / temperature.maximum(1e-12) - (Tensor.rand_like(vals).maximum(1e-12).log().neg()).log()).argmax(axis = -1, keepdim=True)
+      return indices.gather(-1, k).to('CPU')
+    return (logits / temperature.maximum(1e-12) - (Tensor.rand_like(logits).maximum(1e-12).log().neg()).log()).argmax(-1, keepdim=True).to('CPU')
 
   def __call__(self, tokens:Tensor, start_pos:int|UOp, temperature:Tensor,topk:int) -> Tensor:
     return (self.prefill_jit if resolve(tokens.shape[1] != 1) else self.rollout_jit)(tokens.contiguous(), start_pos, temperature,topk)
