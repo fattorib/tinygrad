@@ -97,7 +97,7 @@ decode    127:   9.51 ms,   105.12 tok/s,  122.72 GB/s, 1167/7556 MB
 ```
 
 
-7. JIT the CPU copybacks -> one less HCQ submit which adds overhead of ~1ms
+7. JIT the CPU copybacks -> one less HCQ submit & link which adds overhead of ~1ms
 ```JITBEAM=1
 prefill  2500: 3787.65 ms,   660.04 tok/s,   41.53 GB/s, 157307/7320 MB  --
 decode    127:   7.81 ms,   128.05 tok/s,  204.67 GB/s, 1598/7323 MB  --  1203 1204 1205 1206 1207 1208 1209
