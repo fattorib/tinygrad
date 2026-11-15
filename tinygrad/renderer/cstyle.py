@@ -308,6 +308,7 @@ class ClangRenderer(CStyleLanguage):
   extra_matcher = PatternMatcher([(UPat.var("x", dtypes.float64).cast(dtypes.float16), lambda x: x.cast(dtypes.float32).cast(dtypes.float16))]) \
     + pm_narrow_uint + create_non_native_float_pats((dtypes.bfloat16,)) + pm_manual_bf16_cast
 
+  # NOTE: we need (f32, 8) to be a valid count
   def render_vector_prefix(self, dt:DType, count:int) -> str:
     # round (down) to power of two (this is actually the default clang behavior)
     alignment = dt.itemsize if self.target.device == "CPU" else (2**int(math.log2(dt.itemsize * count)) if not dtypes.is_bool(dt) else 1)

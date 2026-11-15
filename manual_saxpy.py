@@ -4,7 +4,6 @@ from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.renderer.cstyle import ClangRenderer, Target
 from tinygrad.device import Device
 import pathlib
-import numpy as np 
 import time
 import functools 
 
@@ -27,26 +26,19 @@ def ymm_saxpy(z:UOp,x:UOp,y:UOp):
 def custom_saxpy(x,y):
     z = Tensor.empty_like(x).contiguous()
     return Tensor.custom_kernel(z, x, y, fxn=ymm_saxpy)[0].realize()
-
-out = custom_saxpy(x,y)
-
-np.testing.assert_allclose(out.numpy(), (2.0 * x + y).numpy(), rtol=1e-6, atol=1e-6)
+# out = custom_saxpy(x,y)
+# np.testing.assert_allclose(out.numpy(), (2.0 * x + y).numpy(), rtol=1e-6, atol=1e-6)
 
 @TinyJit
 def saxpy(a, x,y):
     return (a*x + y).realize()
 
 for _ in range(10):
-    t0 = time.perf_counter()
-    # out = custom_saxpy(x,y)
-    # Device[Device.DEFAULT].synchronize()
-    t1 = time.perf_counter()
-
     t2 = time.perf_counter()
     saxpy(a,x,y)
     Device[Device.DEFAULT].synchronize()
     t3 = time.perf_counter()
-    print(f"{t1-t0:.4f}s | {t3-t2:.4f}s")
+    print(f"{t3-t2:.4f}s")
 
 
-# DEV=CPU python3 manual_saxpy.py
+# DEV=CPU:CLANG:x86_64,znver2,avx2 python3 manual_saxpy.py
