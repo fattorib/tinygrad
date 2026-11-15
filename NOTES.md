@@ -24,4 +24,5 @@ Upcast:
             - Make a custom renderer for float_8, update heuristic to condition on this, if possible
             - Change the PM renderer to use this 
 
-    The optimization we are applying is OptOps.SPLIT
+    - This now works and when JITBEAM=0, this generates code for MM and SAXPY using YMM registers (MM still dos vxorps on xmms, but pretty sure thats just to 0 the registers)
+    Next is to understand why this breaks with JITBEAM (optimal should not be 8_8 UPCAST, probably 8_4 or smth else) 
