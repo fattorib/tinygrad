@@ -23,3 +23,5 @@ Upcast:
 
             - Make a custom renderer for float_8, update heuristic to condition on this, if possible
             - Change the PM renderer to use this 
+
+    The optimization we are applying is OptOps.SPLIT

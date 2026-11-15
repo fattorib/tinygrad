@@ -104,7 +104,7 @@ pm_simplify_add_image = PatternMatcher([
 ])
 
 def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
-  if getenv("DMC"): return sink
+  if getenv("DMC"): return sink # TODO(fattorib): dead code?
 
   # collect
   memory: defaultdict[tuple[Ops, UOp, UOp|None, UOp, object, int|tuple[int, int]], dict[int, list[UOp]]] = defaultdict(dict)
@@ -141,7 +141,9 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
       must_divide = False
     elif buf.dtype in (dtypes.float, dtypes.half, dtypes.int, dtypes.uint, *dtypes.fp8s) and ctx.supports_float4:
       # TODO: a better way to get this than ctx
-      lengths = [8,4,2] if buf.dtype == dtypes.half and getenv("ALLOW_HALF8") else [4,2]
+      if 'avx2' in ctx.target.arch: lengths = [8,4,2] # NOTE(fattorib): hacky
+      else:
+        lengths = [8,4,2] if buf.dtype == dtypes.half and getenv("ALLOW_HALF8") else [4,2]
     lengths.append(1)  # worst case, it's not folded
     # do the grouping
     for _,group in itertools.groupby(enumerate(sorted(offsets.keys())), lambda x: x[1]-x[0]):
@@ -162,6 +164,5 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
           ld = idx.load(arg=ld_arg)
           for i,g in enumerate(grp):
             for oo in g: replacements[oo] = ld.index(i)
-
   # apply
   return sink.substitute(replacements, name="memory coalescing")
