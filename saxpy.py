@@ -17,4 +17,4 @@ for _ in range(10):
     Device[Device.DEFAULT].synchronize()
 
 # run like:
-# VIZ=1 DEV=CPU:CLANG:x86_64,znver3,avx2 python3 saxpy.py
+#  JITBEAM=1 IGNORE_BEAM_CACHE=1 DEBUG=2 DEV=CPU:CLANG:x86_64,skylake,avx2 python3 saxpy.py
