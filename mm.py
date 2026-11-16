@@ -1,7 +1,7 @@
 from tinygrad import Tensor, TinyJit
-import time 
+import time
 from tinygrad.device import Device
-N = 512; 
+N = 512
 a, b = Tensor.empty(N, N), Tensor.empty(N, N)
 
 @TinyJit
@@ -9,7 +9,7 @@ def mm(a,b):
     return (a.reshape(N, 1, N) * b.T.reshape(1, N, N)).sum(axis=2).realize()
 
 def flops(s):
-    return (2 * N * N * N)/1e9 /s 
+    return (2 * N * N * N)/1e9 /s
 
 for _ in range(10):
     t2 = time.perf_counter()
