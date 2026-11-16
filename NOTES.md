@@ -25,4 +25,6 @@ Upcast:
             - Change the PM renderer to use this 
 
     - This now works and when JITBEAM=0, this generates code for MM and SAXPY using YMM registers (MM still dos vxorps on xmms, but pretty sure thats just to 0 the registers)
+
     Next is to understand why this breaks with JITBEAM (optimal should not be 8_8 UPCAST, probably 8_4 or smth else) 
+        - Also this breaks the use of float4 and float8 together (i.e.) everythig is a float8 which seems wrong probably

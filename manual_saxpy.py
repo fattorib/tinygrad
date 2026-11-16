@@ -30,7 +30,7 @@ def custom_saxpy(x,y):
 # np.testing.assert_allclose(out.numpy(), (2.0 * x + y).numpy(), rtol=1e-6, atol=1e-6)
 
 @TinyJit
-def saxpy(a, x,y):
+def saxpy(a,x,y):
     return (a*x + y).realize()
 
 for _ in range(10):
@@ -41,4 +41,4 @@ for _ in range(10):
     print(f"{t3-t2:.4f}s")
 
 
-# DEV=CPU:CLANG:x86_64,znver2,avx2 python3 manual_saxpy.py
+# DEV=CPU:CLANG:x86_64,znver3,avx2 python3 manual_saxpy.py

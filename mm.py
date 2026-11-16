@@ -1,7 +1,7 @@
 from tinygrad import Tensor, TinyJit
 import time 
 from tinygrad.device import Device
-N = 1024; 
+N = 512; 
 a, b = Tensor.empty(N, N), Tensor.empty(N, N)
 
 @TinyJit
