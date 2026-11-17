@@ -104,7 +104,7 @@ pm_simplify_add_image = PatternMatcher([
 ])
 
 def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
-  if getenv("DMC"): return sink # TODO(fattorib): dead code?
+  if getenv("DMC"): return sink
 
   # collect
   memory: defaultdict[tuple[Ops, UOp, UOp|None, UOp, object, int|tuple[int, int]], dict[int, list[UOp]]] = defaultdict(dict)
