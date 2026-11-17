@@ -109,13 +109,15 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   for axis in to_upcast[::-1]: k.apply_opt(Opt(OptOps.SPLIT, axis, (0, AxisType.UPCAST)))
 
   # potentially do more upcasts of non reduce axes based on a heuristic
-  is_dsp = k.ren.target.device == "DSP"
-  is_avx2 = 'avx2' in k.ren.target.arch
+  # consider all upcastable axes with 3 or 4 upcast (128 on the DSP, 8 on AVX2)
+  if k.ren.target.device == "DSP": upcast_amounts = [128]
+  elif (k.ren.target.device == 'CPU' and k.ren.supports_float8): upcast_amounts = [8,4,3]
+  else: upcast_amounts = [3,4]
+
   upcasted_axis: set[int] = set()
   while resolve(prod(k.full_shape[i] for i in k.upcastable_dims()) >= 1024) and (k.upcast_size() < 32):
     xb_choices = []
-    # consider all upcastable axes with 3 or 4 upcast (128 on the DSP)
-    for axis, upcast_amount in itertools.product(k.upcastable_dims(), ([128] if not len(upcasted_axis) else []) if is_dsp else ([8] if is_avx2 else [3,4])):
+    for axis, upcast_amount in itertools.product(k.upcastable_dims(), upcast_amounts):
       # if we haven't upcasted it, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
       if axis in upcasted_axis or k.full_shape[axis]%upcast_amount != 0: continue
       rng = k.rngs[axis]
@@ -131,7 +133,7 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
             if c.op is Ops.MUL and c.src[1] is rng and c.src[0].op is Ops.CONST: sum_strides += c.src[0].val
         xb_choices.append((num_strides, sum_strides, axis, upcast_amount))
     if xb_choices:
-      xb_choices = sorted(xb_choices)
+      xb_choices = sorted(xb_choices, key=lambda c: (c[0], c[1], c[2], -c[3])) # tie break on larger upcast
       if DEBUG >= 4: print(f"more upcast axis : {xb_choices}")
       k.apply_opt(Opt(OptOps.SPLIT, xb_choices[0][2], (xb_choices[0][3], AxisType.UPCAST)))
       upcasted_axis.add(xb_choices[0][2])

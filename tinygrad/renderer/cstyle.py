@@ -329,6 +329,7 @@ class ClangRenderer(CStyleLanguage):
     super().__init__(target)
     from tinygrad.runtime.support.compiler_cpu import ClangCompiler
     self.compiler = ClangCompiler(target.arch.split(","))
+    self.supports_float8 = (target.device == 'CPU') and ('avx2' in target.arch) and ('-avx2' not in target.arch)
 
 class TCCRenderer(ClangRenderer):
   supports_float4 = False
