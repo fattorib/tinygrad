@@ -30,3 +30,6 @@ Upcast:
     - [ ] Need to actually properly add float8 support to renderer
     - [ ] Confirm we get speedups (...?)
     - [ ] Tests pass
+
+
+    So this seems to work, however code is a bit slop in places, also the padding needs work and need to bench against normal JITBEAM to understand the real perf on these against master and also try a bunch of sizes too 
