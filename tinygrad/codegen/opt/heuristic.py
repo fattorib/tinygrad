@@ -113,7 +113,6 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
   if k.ren.target.device == "DSP": upcast_amounts = [128]
   elif (k.ren.target.device == 'CPU' and k.ren.supports_float8): upcast_amounts = [8,4,3]
   else: upcast_amounts = [3,4]
-
   upcasted_axis: set[int] = set()
   while resolve(prod(k.full_shape[i] for i in k.upcastable_dims()) >= 1024) and (k.upcast_size() < 32):
     xb_choices = []
