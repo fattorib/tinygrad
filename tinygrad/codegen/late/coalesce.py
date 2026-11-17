@@ -142,6 +142,7 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
     elif buf.dtype in (dtypes.float,dtypes.int) and ctx.supports_float8:
       lengths = [8,4,2]
     elif buf.dtype in (dtypes.float, dtypes.half, dtypes.int, dtypes.uint, *dtypes.fp8s) and ctx.supports_float4:
+      # TODO: a better way to get this than ctx
       lengths = [8,4,2] if buf.dtype == dtypes.half and getenv("ALLOW_HALF8") else [4,2]
     lengths.append(1)  # worst case, it's not folded
     # do the grouping
