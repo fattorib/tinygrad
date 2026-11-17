@@ -7,8 +7,8 @@ def saxpy(a, x,y):
     return (a*x + y).realize()
 
 a = 2.0
-x = Tensor.empty((1 << 26) + 1).contiguous()
-y = Tensor.empty((1 << 26) + 1).contiguous()
+x = Tensor.empty((1 << 26)).contiguous()
+y = Tensor.empty((1 << 26)).contiguous()
 
 
 for _ in range(10):

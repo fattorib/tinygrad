@@ -33,3 +33,11 @@ Upcast:
 
 
     So this seems to work, however code is a bit slop in places, also the padding needs work and need to bench against normal JITBEAM to understand the real perf on these against master and also try a bunch of sizes too 
+
+    Tests:
+    (IGNORE_BEAM_CACHE=1 DEV=CPU:CLANG:x86_64,skylake,avx2 python3 -m pytest -n4 test/null/*)
+
+    Null tests failing: 
+        FAILED test/null/test_gen_float4.py::TestFloat4::test_float4_multidim - assert (0, 0) == (4, 2)
+        FAILED test/null/test_gen_float4.py::TestFloat4::test_float4_multidim_unaligned_load - assert (0, 0) == (0, 2)
+        FAILED test/null/test_device.py::TestDevice::test_compiler_autodetect_fallback - RuntimeError: broken
