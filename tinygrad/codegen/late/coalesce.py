@@ -103,6 +103,21 @@ pm_simplify_add_image = PatternMatcher([
   (UPat(Ops.INDEX, dtype=dtypes.float, name="x").store(UPat(name="d", dtype=dtypes.half)), store_image),
 ])
 
+@functools.cache
+def dtypectx_to_length(dtype:DType,ctx:Renderer) -> tuple[bool,list[int]]:
+  lengths = []
+  must_divide = True
+  if ctx.target.device == "DSP":
+    lengths = [128,64,32,16,8,4]
+    must_divide = False
+  elif dtype in (dtypes.float,dtypes.int) and ctx.supports_float8:
+    lengths = [8,4,2]
+  elif dtype in (dtypes.float, dtypes.half, dtypes.int, dtypes.uint, *dtypes.fp8s) and ctx.supports_float4:
+    # TODO: a better way to get this than ctx
+    lengths = [8,4,2] if dtype == dtypes.half and getenv("ALLOW_HALF8") else [4,2]
+  lengths.append(1)  # worst case, it's not folded
+  return must_divide, lengths
+
 def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
   if getenv("DMC"): return sink
 
@@ -133,18 +148,7 @@ def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
   # build replacements
   replacements = {}
   for (op,buf,_,_,ld_arg,_),offsets in memory.items():
-    # allowed lengths (copied in)
-    lengths = []
-    must_divide = True
-    if ctx.target.device == "DSP":
-      lengths = [128,64,32,16,8,4]
-      must_divide = False
-    elif buf.dtype in (dtypes.float,dtypes.int) and ctx.supports_float8:
-      lengths = [8,4,2]
-    elif buf.dtype in (dtypes.float, dtypes.half, dtypes.int, dtypes.uint, *dtypes.fp8s) and ctx.supports_float4:
-      # TODO: a better way to get this than ctx
-      lengths = [8,4,2] if buf.dtype == dtypes.half and getenv("ALLOW_HALF8") else [4,2]
-    lengths.append(1)  # worst case, it's not folded
+    must_divide,lengths = dtypectx_to_length(buf.dtype,ctx)
     # do the grouping
     for _,group in itertools.groupby(enumerate(sorted(offsets.keys())), lambda x: x[1]-x[0]):
       full_grp = [offsets[x] for _,x in group]
