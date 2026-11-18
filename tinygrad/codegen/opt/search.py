@@ -11,7 +11,7 @@ from tinygrad.engine.worker import get_worker_pool, terminate_worker_pool
 from tinygrad.codegen import to_program
 from tinygrad.codegen.opt.postrange import Scheduler
 
-actions = [Opt(op=OptOps.SPLIT, axis=axis, arg=(amt, AxisType.UPCAST)) for amt in [0,2,3,4,5,7] for axis in range(10)]
+actions = [Opt(op=OptOps.SPLIT, axis=axis, arg=(amt, AxisType.UPCAST)) for amt in [0,2,3,4,5,7,8] for axis in range(10)]
 actions += [Opt(op=OptOps.SPLIT, axis=axis, arg=(amt, AxisType.LOCAL)) for amt in [0,2,3,4,8,13,16,29] for axis in range(8)]
 actions += [Opt(op=OptOps.SPLIT, axis=axis, arg=(amt, AxisType.LOCAL, True)) for amt in [13,16,28,29,32,49,64,256] for axis in range(8)]
 if getenv("BEAM_PADTO", 0): actions += [Opt(op=OptOps.PADTO, axis=axis, arg=amt) for amt in [32] for axis in range(7)]
