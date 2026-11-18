@@ -18,7 +18,7 @@
 //#define DEBUG
 
 #ifdef DEBUG
-  #define N 1024
+  #define N 8
 #endif
 
 #ifndef N
@@ -174,21 +174,21 @@ int main() {
     //if (i%4 == 0) sleep(1);
   }
 
-// #ifdef DEBUG
-  // for (int i = 0; i < N*N; i++) {
-    // if (i%N == 0 && i != 0) printf("\n");
-    // printf("%f ", C[i]);
-  // }
-  // printf("\n");
-// #else
-  // for (int k = 0; k < N*N; k++) {
-    // if (fabsf(C[k] - val[k]) > 1e-3) {
-      // printf("MISMATCH AT %d, %f != %f\n", k, C[k], val[k]);
-      // return -1;
-    // }
-  // }
-  // printf("match\n");
-// #endif
-// 
+#ifdef DEBUG
+  for (int i = 0; i < N*N; i++) {
+    if (i%N == 0 && i != 0) printf("\n");
+    printf("%f ", C[i]);
+  }
+  printf("\n");
+#else
+  for (int k = 0; k < N*N; k++) {
+    if (fabsf(C[k] - val[k]) > 1e-3) {
+      printf("MISMATCH AT %d, %f != %f\n", k, C[k], val[k]);
+      return -1;
+    }
+  }
+  printf("match\n");
+#endif
+
   return 0;
 }
