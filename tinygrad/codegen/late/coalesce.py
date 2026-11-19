@@ -110,7 +110,7 @@ def dtypectx_to_length(dtype:DType,ctx:Renderer) -> tuple[bool,list[int]]:
   if ctx.target.device == "DSP":
     lengths = [128,64,32,16,8,4]
     must_divide = False
-  elif dtype in (dtypes.float,dtypes.int) and ctx.supports_float8:
+  elif dtype in (dtypes.float,dtypes.int, dtypes.uint) and ctx.supports_float8:
     lengths = [8,4,2]
   elif dtype in (dtypes.float, dtypes.half, dtypes.int, dtypes.uint, *dtypes.fp8s) and ctx.supports_float4:
     # TODO: a better way to get this than ctx
