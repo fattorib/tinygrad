@@ -147,6 +147,8 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
         # if it's small, upcast a second reduce dimension too
         if (axes:=k.upcastable_dims(reduce=True)) and s <= 3 and k.full_shape[axes[-1]] <= 3:
           k.apply_opt(Opt(OptOps.SPLIT, axes[-1], (0, AxisType.UPCAST)))
+      elif (k.ren.target.device == 'CPU' and k.ren.supports_float8) and (k.full_shape[axes[-1]] % 8 == 0):
+        k.apply_opt(Opt(OptOps.SPLIT, axes[-1], (8, AxisType.UPCAST)))
       elif k.full_shape[axes[-1]] % 4 == 0:
         k.apply_opt(Opt(OptOps.SPLIT, axes[-1], (4, AxisType.UPCAST)))
   except KernelOptError: pass
@@ -156,7 +158,6 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
     k.apply_opt(Opt(OptOps.SPLIT, axes[-1], (4, AxisType.UPCAST)))
 
   # **** local groups ****
-
   if k.ren.has_local:
     if k.ren.target.device == "QCOM":
       # for openpilot: use 32..128 threads per workgroup, at most 8 on the innermost axis
